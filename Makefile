@@ -33,20 +33,12 @@ clean:
 	rm -f $(TARGET)
 	@echo "Clean complete"
 
-# Install to /usr/local/bin (optional)
-.PHONY: install
-install: $(TARGET)
-	@echo "Installing camera-monitor to /usr/local/bin..."
-	sudo cp $(TARGET) /usr/local/bin/
-	sudo chmod +x /usr/local/bin/$(TARGET)
-	@echo "Installation complete"
-
-# Uninstall from /usr/local/bin
-.PHONY: uninstall
-uninstall:
-	@echo "Removing camera-monitor from /usr/local/bin..."
-	sudo rm -f /usr/local/bin/$(TARGET)
-	@echo "Uninstall complete"
+# Format Swift code
+.PHONY: format
+format:
+	@echo "Formatting Swift code..."
+	swift format --in-place $(SWIFT_FILES)
+	@echo "Format complete"
 
 # Help target
 .PHONY: help
@@ -57,6 +49,5 @@ help:
 	@echo "  build     - Compile the camera monitor"
 	@echo "  run       - Build and run the camera monitor"
 	@echo "  clean     - Remove compiled binaries"
-	@echo "  install   - Install to /usr/local/bin (requires sudo)"
-	@echo "  uninstall - Remove from /usr/local/bin (requires sudo)"
+	@echo "  format    - Format Swift code using swift format"
 	@echo "  help      - Show this help message"

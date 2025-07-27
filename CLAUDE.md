@@ -27,8 +27,8 @@ make run
 # Clean compiled binaries
 make clean
 
-# Install system-wide (optional)
-make install
+# Format Swift code (requires swift-format)
+make format
 
 # Show all available targets
 make help

@@ -67,3 +67,7 @@ fastlane/test_output
 
 # Compiled executables
 camera-monitor
+
+# Claude Code - exclude all except settings.json
+.claude/*
+!.claude/settings.json
