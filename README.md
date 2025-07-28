@@ -1,10 +1,18 @@
 # Camera Notifier
 
-macOS camera monitoring tool that automatically controls SwitchBot devices when camera starts/stops.
+macOS camera monitoring tool that automatically controls SwitchBot devices when camera starts/stops. Supports background service mode with automatic startup.
 
 ## Overview
 
 Automatically turns SwitchBot plugs ON when camera starts and OFF when camera stops. Perfect for automating lighting, fans, or other devices during video calls and recordings.
+
+### Features
+
+- 🎥 **Real-time camera monitoring** using CoreMediaIO framework
+- 🔌 **SwitchBot device control** with automatic device detection
+- 🚀 **macOS auto-start support** via launchd background service
+- 📊 **Comprehensive logging** with separate error tracking
+- ⚙️ **Extensible handler system** for future integrations
 
 ## Use Cases
 
@@ -36,6 +44,55 @@ make run
 
 # Or run directly
 SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./camera-notifier
+```
+
+## Auto-Start Setup (Optional)
+
+To run camera-notifier automatically at startup as a background service:
+
+### Quick Setup (Recommended)
+
+```bash
+# 1. Set environment variables
+export SWITCHBOT_TOKEN="your_token_here"
+export SWITCHBOT_SECRET="your_secret_here"
+
+# 2. Run installation script
+./scripts/install-launchd.sh
+```
+
+### Manual Setup
+
+```bash
+# 1. Build the project
+make build
+
+# 2. Copy and edit plist template
+cp launchd/com.sugyan.camera-notifier.plist.template ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+
+# 3. Edit the plist file and replace placeholders:
+#    {{BINARY_PATH}} - Full path to binary
+#    {{SWITCHBOT_TOKEN}} - Your API token
+#    {{SWITCHBOT_SECRET}} - Your API secret
+
+# 4. Load the service
+launchctl load ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+```
+
+### Service Management
+
+```bash
+# Check service status
+launchctl list | grep camera-notifier
+
+# View logs
+tail -f /tmp/camera-notifier.log
+
+# Stop service
+launchctl stop com.sugyan.camera-notifier
+
+# Disable auto-start
+launchctl unload ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
 ```
 
 ## Examples
@@ -87,6 +144,27 @@ Grant camera access in: **System Preferences → Security & Privacy → Camera**
 - Verify device is connected in SwitchBot app
 - Check token/secret are correct
 - Ensure internet connectivity
+
+### Service Issues
+
+Check log files for detailed information:
+
+```bash
+# View normal operation logs
+tail -f /tmp/camera-notifier.log
+
+# View error logs
+tail -f /tmp/camera-notifier-error.log
+
+# Check service status
+launchctl list | grep camera-notifier
+```
+
+### Common Issues
+
+- **Service not starting**: Check environment variables in plist file
+- **Camera not detected**: Verify camera permissions in System Preferences
+- **API errors**: Validate SwitchBot token/secret in mobile app
 
 ## Build Commands
 
