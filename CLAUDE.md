@@ -207,6 +207,63 @@ if config.enabledHandlers.contains("slack") {
 - Verify handler names in `--handlers` option or `CAMERA_HANDLERS` are spelled correctly
 - Use Ctrl+C for graceful shutdown
 
+## macOS Auto-Start Setup
+
+### Using launchd (System Service)
+
+To run camera-notifier automatically at startup as a background service:
+
+1. **Build the Binary**:
+   ```bash
+   make build
+   ```
+
+2. **Create Configuration**:
+   Copy and customize the plist template:
+   ```bash
+   cp launchd/com.sugyan.camera-notifier.plist.template ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+   ```
+
+3. **Update Configuration**:
+   Edit `~/Library/LaunchAgents/com.sugyan.camera-notifier.plist` and replace placeholders:
+   - `{{BINARY_PATH}}`: Full path to compiled binary (e.g., `/Users/username/dev/camera-notifier/.build/release/camera-notifier`)
+   - `{{SWITCHBOT_TOKEN}}`: Your SwitchBot API token
+   - `{{SWITCHBOT_SECRET}}`: Your SwitchBot API secret
+   - `{{SWITCHBOT_DEVICE_ID}}`: Target device ID (optional, auto-detects if empty)
+
+4. **Load Service**:
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+   ```
+
+5. **Verify Service**:
+   ```bash
+   launchctl list | grep camera-notifier
+   tail -f /tmp/camera-notifier.log
+   ```
+
+### Service Management Commands
+
+```bash
+# Start service
+launchctl start com.sugyan.camera-notifier
+
+# Stop service
+launchctl stop com.sugyan.camera-notifier
+
+# Unload service (disable auto-start)
+launchctl unload ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+
+# Reload service after config changes
+launchctl unload ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+launchctl load ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+```
+
+### Log Files
+
+- Standard output: `/tmp/camera-notifier.log`
+- Error output: `/tmp/camera-notifier-error.log`
+
 ## Development Workflow
 
 1. **Make Changes**: Edit source files as needed

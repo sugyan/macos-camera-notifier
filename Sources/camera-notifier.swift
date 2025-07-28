@@ -67,26 +67,41 @@ class CameraNotifierApp {
 
   func run() {
     HandlerLogger.log("Camera Notifier starting...")
+    HandlerLogger.log("Process ID: \(ProcessInfo.processInfo.processIdentifier)")
+    HandlerLogger.log("Working directory: \(FileManager.default.currentDirectoryPath)")
 
     // Display configuration
+    HandlerLogger.log("Enabled handlers: \(config.enabledHandlers.joined(separator: ", "))")
+    HandlerLogger.log("Verbose logging: \(config.verboseLogging)")
+    HandlerLogger.log(
+      "Registered handlers: \(handlerRegistry.handlerNames.joined(separator: ", "))")
+
+    // Log environment variables for debugging
     if config.verboseLogging {
-      HandlerLogger.log("Enabled handlers: \(config.enabledHandlers.joined(separator: ", "))")
+      HandlerLogger.log("Environment check:")
       HandlerLogger.log(
-        "Registered handlers: \(handlerRegistry.handlerNames.joined(separator: ", "))")
+        "  SWITCHBOT_TOKEN: \(ProcessInfo.processInfo.environment["SWITCHBOT_TOKEN"] != nil ? "set" : "not set")"
+      )
+      HandlerLogger.log(
+        "  SWITCHBOT_SECRET: \(ProcessInfo.processInfo.environment["SWITCHBOT_SECRET"] != nil ? "set" : "not set")"
+      )
+      HandlerLogger.log(
+        "  SWITCHBOT_DEVICE_ID: \(ProcessInfo.processInfo.environment["SWITCHBOT_DEVICE_ID"] ?? "not set")"
+      )
     }
 
     // Configure all handlers
     do {
       try handlerRegistry.configureAll()
     } catch {
-      HandlerLogger.log("Handler configuration failed: \(error)")
+      HandlerLogger.logError("Handler configuration failed: \(error)")
       showConfigurationHelp()
       exit(1)
     }
 
     let enabledHandlers = handlerRegistry.enabledHandlerNames
     if enabledHandlers.isEmpty {
-      HandlerLogger.log("No handlers are enabled and configured")
+      HandlerLogger.logError("No handlers are enabled and configured")
       showConfigurationHelp()
       exit(1)
     }
@@ -97,7 +112,7 @@ class CameraNotifierApp {
     do {
       cameraMonitor = try CameraMonitor()
     } catch {
-      HandlerLogger.log("Failed to initialize camera monitor: \(error)")
+      HandlerLogger.logError("Failed to initialize camera monitor: \(error)")
       exit(1)
     }
 
@@ -110,7 +125,7 @@ class CameraNotifierApp {
   }
 
   private func showConfigurationHelp() {
-    print(
+    fputs(
       """
 
       Configuration Help:
@@ -130,7 +145,8 @@ class CameraNotifierApp {
       export SWITCHBOT_SECRET="your_secret_here"
       ./camera-notifier
 
-      """)
+      """, stderr)
+    fflush(stderr)
   }
 
   deinit {

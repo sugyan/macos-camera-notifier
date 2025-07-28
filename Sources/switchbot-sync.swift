@@ -39,11 +39,13 @@ public class SwitchBotSyncHandler: CameraStateHandler {
     self.secret = secret
     self.client = SwitchBotClient(token: token, secret: secret)
 
-    // Device ID is optional - will auto-detect if not provided
-    self.targetDeviceId = ProcessInfo.processInfo.environment["SWITCHBOT_DEVICE_ID"]
+    // Device ID is optional - will auto-detect if not provided or empty
+    let deviceIdEnv = ProcessInfo.processInfo.environment["SWITCHBOT_DEVICE_ID"]
+    self.targetDeviceId = (deviceIdEnv?.isEmpty == false) ? deviceIdEnv : nil
 
     if targetDeviceId == nil {
-      // Auto-detect device if not specified
+      // Auto-detect device if not specified or empty
+      HandlerLogger.log("No device ID specified, attempting auto-detection...", handler: name)
       try autoDetectDevice()
     } else {
       HandlerLogger.log("Using specified device: \(targetDeviceId!)", handler: name)

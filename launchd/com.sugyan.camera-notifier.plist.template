@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sugyan.camera-notifier</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{BINARY_PATH}}</string>
+		<string>--verbose</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SWITCHBOT_TOKEN</key>
+		<string>{{SWITCHBOT_TOKEN}}</string>
+		<key>SWITCHBOT_SECRET</key>
+		<string>{{SWITCHBOT_SECRET}}</string>
+		{{SWITCHBOT_DEVICE_ID_LINE}}
+		<key>CAMERA_HANDLERS</key>
+		<string>switchbot</string>
+		<key>VERBOSE</key>
+		<string>1</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>/tmp/camera-notifier.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/tmp/camera-notifier-error.log</string>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>LowPriorityIO</key>
+	<true/>
+</dict>
+</plist>

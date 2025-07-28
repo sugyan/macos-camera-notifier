@@ -119,10 +119,33 @@ public class HandlerLogger {
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
     let timestamp = formatter.string(from: Date())
 
+    let logMessage: String
     if let handler = handler {
-      print("[\(timestamp)] [\(handler)] \(message)")
+      logMessage = "[\(timestamp)] [\(handler)] \(message)"
     } else {
-      print("[\(timestamp)] \(message)")
+      logMessage = "[\(timestamp)] \(message)"
     }
+
+    // Force output to stdout and flush immediately for launchd compatibility
+    print(logMessage)
+    fflush(stdout)
+  }
+
+  // Error logging to stderr
+  public static func logError(_ message: String, handler: String? = nil) {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let timestamp = formatter.string(from: Date())
+
+    let logMessage: String
+    if let handler = handler {
+      logMessage = "[\(timestamp)] [ERROR] [\(handler)] \(message)"
+    } else {
+      logMessage = "[\(timestamp)] [ERROR] \(message)"
+    }
+
+    // Output to stderr for error messages
+    fputs(logMessage + "\n", stderr)
+    fflush(stderr)
   }
 }

@@ -25,7 +25,7 @@ public enum CameraMonitorError: Error {
 // Camera monitoring class with callback support
 public class CameraMonitor {
   private let deviceIDs: [CMIOObjectID]
-  private var lastState: Bool? = nil
+  private var lastState: Bool? = false
 
   public typealias StateChangeCallback = (CameraStateChange) -> Void
 
@@ -106,17 +106,33 @@ public class CameraMonitor {
 
   // Monitor camera state changes and call callback on changes
   public func startMonitoring(interval: UInt32 = 1, onStateChange: @escaping StateChangeCallback) {
+    logMessage("Camera monitoring loop started with \(deviceIDs.count) devices")
+
     while true {
       let currentState = checkCameraState()
 
       // Only call callback on state changes
       if lastState == nil || lastState != currentState.isRunning {
+        logMessage(
+          "Camera state changed: \(currentState.isRunning ? "ON" : "OFF") - Device: \(currentState.deviceName ?? "unknown")"
+        )
         onStateChange(currentState)
         lastState = currentState.isRunning
       }
 
       sleep(interval)
     }
+  }
+
+  // Helper method for logging with forced flush
+  private func logMessage(_ message: String) {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let timestamp = formatter.string(from: Date())
+    let logMsg = "[\(timestamp)] [CameraMonitor] \(message)"
+
+    print(logMsg)
+    fflush(stdout)
   }
 
   // Single check without monitoring loop - useful for polling from external loop
