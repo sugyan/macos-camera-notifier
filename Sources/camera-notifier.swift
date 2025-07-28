@@ -1,6 +1,7 @@
 // Camera Notifier - Lightweight entry point for camera monitoring with extensible handlers
 // Manages camera monitoring and dispatches state changes to configured handlers
 
+import ArgumentParser
 import CoreMediaIO
 import Foundation
 
@@ -9,15 +10,16 @@ struct AppConfig {
   let enabledHandlers: Set<String>
   let verboseLogging: Bool
 
-  init() {
-    // Parse enabled handlers from environment variable
-    let handlersEnv = ProcessInfo.processInfo.environment["CAMERA_HANDLERS"] ?? "switchbot"
+  init(handlers: String? = nil, verbose: Bool = false) {
+    // Parse enabled handlers from parameter or environment variable
+    let handlersEnv =
+      handlers ?? ProcessInfo.processInfo.environment["CAMERA_HANDLERS"] ?? "switchbot"
     self.enabledHandlers = Set(
       handlersEnv.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
     )
 
     // Enable verbose logging if requested
-    self.verboseLogging = ProcessInfo.processInfo.environment["VERBOSE"] == "1"
+    self.verboseLogging = verbose || ProcessInfo.processInfo.environment["VERBOSE"] == "1"
   }
 }
 
@@ -27,8 +29,8 @@ class CameraNotifierApp {
   private let handlerRegistry: CameraStateHandlerRegistry
   private var cameraMonitor: CameraMonitor?
 
-  init() {
-    self.config = AppConfig()
+  init(config: AppConfig) {
+    self.config = config
     self.handlerRegistry = CameraStateHandlerRegistry()
 
     setupSignalHandlers()
@@ -136,69 +138,24 @@ class CameraNotifierApp {
   }
 }
 
-// Application entry point
+// Application entry point with ArgumentParser
 @main
-struct CameraNotifierMain {
-  static func main() {
-    // Handle command line arguments
-    let arguments = CommandLine.arguments
+struct CameraNotifier: ParsableCommand {
+  static let configuration = CommandConfiguration(
+    commandName: "camera-notifier",
+    abstract: "macOS camera monitoring with extensible handlers",
+    version: "1.0.0"
+  )
 
-    if arguments.contains("--help") || arguments.contains("-h") {
-      showHelp()
-      exit(0)
-    }
+  @Option(name: .long, help: "Comma-separated list of handlers to enable (default: switchbot)")
+  var handlers: String?
 
-    if arguments.contains("--version") || arguments.contains("-v") {
-      showVersion()
-      exit(0)
-    }
+  @Flag(name: .shortAndLong, help: "Enable verbose logging")
+  var verbose: Bool = false
 
-    // Create and run the application
-    let app = CameraNotifierApp()
+  mutating func run() throws {
+    let config = AppConfig(handlers: handlers, verbose: verbose)
+    let app = CameraNotifierApp(config: config)
     app.run()
-  }
-
-  private static func showHelp() {
-    print(
-      """
-      Camera Notifier - macOS camera monitoring with extensible handlers
-
-      USAGE:
-          camera-notifier [OPTIONS]
-
-      OPTIONS:
-          -h, --help      Show this help message
-          -v, --version   Show version information
-
-      ENVIRONMENT VARIABLES:
-          CAMERA_HANDLERS     Comma-separated list of handlers (default: "switchbot")
-          VERBOSE            Set to "1" for verbose logging
-          
-          SwitchBot Handler:
-          SWITCHBOT_TOKEN    Your SwitchBot API token (required)
-          SWITCHBOT_SECRET   Your SwitchBot API secret (required)
-          SWITCHBOT_DEVICE_ID Target device ID (optional)
-
-      EXAMPLES:
-          # Basic usage with SwitchBot
-          export SWITCHBOT_TOKEN="your_token"
-          export SWITCHBOT_SECRET="your_secret"
-          camera-notifier
-          
-          # Verbose logging
-          export VERBOSE=1
-          camera-notifier
-          
-          # Multiple handlers (when available)
-          export CAMERA_HANDLERS="switchbot,slack"
-          camera-notifier
-
-      For more information, see the README.md file.
-      """)
-  }
-
-  private static func showVersion() {
-    print("Camera Notifier v1.0.0")
-    print("macOS camera monitoring utility with extensible handlers")
   }
 }

@@ -36,8 +36,8 @@ This is a macOS camera monitoring utility with extensible handler system for aut
 
 **camera-notifier.swift**: Main application entry point that:
 
-- Lightweight configuration and dispatch management
-- Command-line argument parsing (--help, --version)
+- Uses Swift Argument Parser for type-safe CLI argument parsing
+- Supports --handlers and --verbose command-line options
 - Environment variable configuration system
 - Signal handling for graceful shutdown (SIGINT, SIGTERM)
 - Registry-based handler management
@@ -46,16 +46,17 @@ This is a macOS camera monitoring utility with extensible handler system for aut
 
 ```
 camera-notifier/
-├── camera-monitor.swift          # Camera monitoring library
-├── camera-state-handler.swift    # Handler protocol and registry
-├── switchbot-sync.swift          # SwitchBot integration handler
-├── camera-notifier.swift         # Main application entry point
-├── camera-notifier               # Compiled binary (gitignored)
+├── Package.swift                 # Swift Package Manager configuration
+├── Sources/                      # Source code directory
+│   ├── camera-monitor.swift      # Camera monitoring library
+│   ├── camera-state-handler.swift # Handler protocol and registry
+│   ├── switchbot-sync.swift      # SwitchBot integration handler
+│   └── camera-notifier.swift     # Main application entry point
+├── .build/release/camera-notifier # Compiled binary (SPM output)
 ├── Makefile                      # Build configuration
 ├── README.md                     # User documentation
 ├── CLAUDE.md                     # This file
-├── .gitignore                    # Git ignore rules
-└── tmp/                          # Development files
+└── .gitignore                    # Git ignore rules
 ```
 
 ## Common Commands
@@ -69,12 +70,6 @@ make build
 # Build and run the notifier (requires environment variables)
 make run
 
-# Run with verbose logging
-make run-verbose
-
-# Show application help
-make run-help
-
 # Clean compiled binaries
 make clean
 
@@ -85,19 +80,31 @@ make format
 make help
 ```
 
-### Manual Building
+### Using Swift Package Manager Directly
 
 ```bash
-# Compile manually
-swiftc -framework CoreMediaIO -O -parse-as-library camera-monitor.swift camera-state-handler.swift switchbot-sync.swift camera-notifier.swift -o camera-notifier
+# Build with Swift Package Manager
+swift build -c release
+
+# Run the built binary directly
+./.build/release/camera-notifier --help
+./.build/release/camera-notifier --verbose
+./.build/release/camera-notifier --handlers switchbot
 
 # Run with environment variables
-SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./camera-notifier
+SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./.build/release/camera-notifier
 ```
 
-## Environment Variables
+## Configuration Options
 
-### Application Configuration
+### Command Line Arguments (via Swift Argument Parser)
+
+- `--handlers <handlers>`: Comma-separated list of handlers to enable (default: "switchbot")
+- `--verbose` / `-v`: Enable verbose logging
+- `--help` / `-h`: Show help information
+- `--version`: Show version information
+
+### Environment Variables (fallback)
 
 - `CAMERA_HANDLERS`: Comma-separated list of handlers to enable (default: "switchbot")
 - `VERBOSE`: Enable verbose logging ("1" to enable)
@@ -134,10 +141,11 @@ SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./camera-notifier
 
 ### Build System
 
-- Single binary compilation with parse-as-library flag
-- Modular source file organization
-- Makefile with multiple convenience targets
-- Git ignore for compiled binaries
+- Uses Swift Package Manager for dependency management
+- Swift Argument Parser for CLI argument parsing
+- Modular source file organization in Sources/ directory
+- Simplified Makefile with essential targets
+- Binary output in .build/release/ directory
 
 ## Adding New Handlers
 
@@ -168,7 +176,7 @@ if config.enabledHandlers.contains("slack") {
 }
 ```
 
-3. **Update Build**: Add file to `SWIFT_FILES` in Makefile
+3. **Update Build**: Add file to Sources/ directory (automatically included by SPM)
 
 4. **Update Documentation**: Add environment variables and usage examples
 
@@ -194,9 +202,9 @@ if config.enabledHandlers.contains("slack") {
 
 ### Runtime Issues
 
-- Use `VERBOSE=1` for detailed logging
+- Use `--verbose` flag or `VERBOSE=1` environment variable for detailed logging
 - Check environment variable names and values
-- Verify handler names in `CAMERA_HANDLERS` are spelled correctly
+- Verify handler names in `--handlers` option or `CAMERA_HANDLERS` are spelled correctly
 - Use Ctrl+C for graceful shutdown
 
 ## Development Workflow
