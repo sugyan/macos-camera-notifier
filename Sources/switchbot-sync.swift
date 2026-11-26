@@ -224,7 +224,9 @@ public class SwitchBotSyncHandler: CameraStateHandler {
   // Wake up flush/cleanup callers once nothing is in flight (a scheduled retry does not count)
   private func signalIdleWaiters() {
     guard !inFlight, !hasPending else { return }
-    idleWaiters.forEach { $0.signal() }
+    for waiter in idleWaiters {
+      waiter.signal()
+    }
     idleWaiters.removeAll()
   }
 
