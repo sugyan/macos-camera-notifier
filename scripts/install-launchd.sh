@@ -8,8 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PLIST_TEMPLATE="$PROJECT_DIR/launchd/com.sugyan.camera-notifier.plist.template"
-PLIST_DEST="$HOME/Library/LaunchAgents/com.sugyan.camera-notifier.plist"
+LABEL="com.sugyan.camera-notifier"
+PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 BINARY_PATH="$PROJECT_DIR/.build/release/camera-notifier"
+DOMAIN="gui/$(id -u)"
 
 echo "🔧 Camera Notifier - launchd Setup"
 echo "=================================="
@@ -47,13 +49,9 @@ fi
 
 echo "✅ Environment variables OK"
 
-# Build binary if it doesn't exist
-if [[ ! -f "$BINARY_PATH" ]]; then
-    echo "🔨 Building camera-notifier binary..."
-    cd "$PROJECT_DIR"
-    make clean build
-    cd - > /dev/null
-fi
+# Always build (incremental) so the service runs the current sources
+echo "🔨 Building camera-notifier binary..."
+(cd "$PROJECT_DIR" && make build)
 
 if [[ ! -f "$BINARY_PATH" ]]; then
     echo "❌ Error: Failed to build binary at $BINARY_PATH"
@@ -84,34 +82,43 @@ sed "s|{{BINARY_PATH}}|$BINARY_PATH|g; \
      s|{{SWITCHBOT_DEVICE_ID_LINE}}|${DEVICE_ID_LINE}|g" \
     "$PLIST_TEMPLATE" > "$PLIST_DEST"
 
+# The plist contains the API token and secret: keep it private
+chmod 600 "$PLIST_DEST"
+
 echo "✅ Created plist at $PLIST_DEST"
 
 # Unload existing service if it exists
-if launchctl list | grep -q "com.sugyan.camera-notifier"; then
+if launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; then
     echo "🔄 Unloading existing service..."
-    launchctl unload "$PLIST_DEST" 2>/dev/null || true
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 fi
 
-# Load the service
+# Load the service (retry briefly: bootstrap can fail while the old instance is still exiting)
 echo "🚀 Loading service..."
-launchctl load "$PLIST_DEST"
+for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "$DOMAIN" "$PLIST_DEST" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
 
 # Verify service is running
 sleep 2
-if launchctl list | grep -q "com.sugyan.camera-notifier"; then
+if launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; then
     echo "✅ Service loaded successfully!"
     echo ""
     echo "📊 Service Status:"
-    launchctl list | grep "com.sugyan.camera-notifier" || echo "   Service not found in list"
+    launchctl print "$DOMAIN/$LABEL" | grep -E "^\s*(state|pid|program|last exit code) =" || true
     echo ""
     echo "📁 Log Files:"
     echo "   Output: /tmp/camera-notifier.log"
     echo "   Errors: /tmp/camera-notifier-error.log"
     echo ""
     echo "🎯 Commands:"
-    echo "   Start:   launchctl start com.sugyan.camera-notifier"
-    echo "   Stop:    launchctl stop com.sugyan.camera-notifier"
-    echo "   Unload:  launchctl unload $PLIST_DEST"
+    echo "   Status:  launchctl print $DOMAIN/$LABEL"
+    echo "   Restart: launchctl kickstart -k $DOMAIN/$LABEL"
+    echo "   Stop:    launchctl bootout $DOMAIN/$LABEL"
+    echo "   Start:   launchctl bootstrap $DOMAIN $PLIST_DEST"
     echo "   Logs:    tail -f /tmp/camera-notifier.log"
 else
     echo "❌ Failed to load service"

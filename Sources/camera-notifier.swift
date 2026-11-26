@@ -2,7 +2,6 @@
 // Manages camera monitoring and dispatches state changes to configured handlers
 
 import ArgumentParser
-import CoreMediaIO
 import Foundation
 
 // Main application configuration
@@ -27,26 +26,30 @@ struct AppConfig {
 class CameraNotifierApp {
   private let config: AppConfig
   private let handlerRegistry: CameraStateHandlerRegistry
-  private var cameraMonitor: CameraMonitor?
+  private let cameraMonitor = CameraMonitor()
+  private var signalSources: [DispatchSourceSignal] = []
 
   init(config: AppConfig) {
     self.config = config
     self.handlerRegistry = CameraStateHandlerRegistry()
 
-    setupSignalHandlers()
     registerAvailableHandlers()
   }
 
+  // Handle SIGINT/SIGTERM on the main queue rather than in a C signal handler, where only
+  // async-signal-safe functions may be called. Installed once startup is done; until then the
+  // default action (terminate immediately) applies.
   private func setupSignalHandlers() {
-    // Handle Ctrl+C gracefully
-    signal(SIGINT) { _ in
-      HandlerLogger.log("Received interrupt signal, shutting down...")
-      exit(0)
-    }
-
-    signal(SIGTERM) { _ in
-      HandlerLogger.log("Received termination signal, shutting down...")
-      exit(0)
+    for (signalNumber, description) in [(SIGINT, "interrupt"), (SIGTERM, "termination")] {
+      signal(signalNumber, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
+      source.setEventHandler { [weak self] in
+        HandlerLogger.log("Received \(description) signal, shutting down...")
+        self?.handlerRegistry.cleanup()
+        exit(0)
+      }
+      source.resume()
+      signalSources.append(source)
     }
   }
 
@@ -54,6 +57,11 @@ class CameraNotifierApp {
     // Register SwitchBot handler if enabled
     if config.enabledHandlers.contains("switchbot") {
       handlerRegistry.register(SwitchBotSyncHandler())
+    }
+
+    // Log-only handler, useful to check camera detection without side effects
+    if config.enabledHandlers.contains("log") {
+      handlerRegistry.register(LogHandler())
     }
 
     // Future handlers can be added here:
@@ -108,20 +116,18 @@ class CameraNotifierApp {
 
     HandlerLogger.log("Active handlers: \(enabledHandlers.joined(separator: ", "))")
 
-    // Initialize camera monitor
-    do {
-      cameraMonitor = try CameraMonitor()
-    } catch {
-      HandlerLogger.logError("Failed to initialize camera monitor: \(error)")
-      exit(1)
+    setupSignalHandlers()
+
+    // Start monitoring with handler dispatch
+    cameraMonitor.start { [handlerRegistry] change in
+      handlerRegistry.handleCameraStateChange(change)
     }
 
     HandlerLogger.log("Camera monitoring started. Press Ctrl+C to stop.")
 
-    // Start monitoring with handler dispatch
-    cameraMonitor?.startMonitoring { [weak self] change in
-      self?.handlerRegistry.handleCameraStateChange(change)
-    }
+    // Everything from here on is event driven (CoreMediaIO listeners, timers, signals, network
+    // callbacks), so the main thread must not block: run the main run loop forever.
+    RunLoop.main.run()
   }
 
   private func showConfigurationHelp() {
@@ -132,11 +138,12 @@ class CameraNotifierApp {
 
       Environment Variables:
       - CAMERA_HANDLERS: Comma-separated list of handlers to enable (default: "switchbot")
+        Available handlers: switchbot, log (log only prints camera state changes)
       - VERBOSE: Set to "1" for verbose logging
 
       SwitchBot Handler:
       - SWITCHBOT_TOKEN: Your SwitchBot API token (required)
-      - SWITCHBOT_SECRET: Your SwitchBot API secret (required)  
+      - SWITCHBOT_SECRET: Your SwitchBot API secret (required)
       - SWITCHBOT_DEVICE_ID: Target device ID (optional, auto-detects if not set)
 
       Example:
@@ -148,10 +155,6 @@ class CameraNotifierApp {
       """, stderr)
     fflush(stderr)
   }
-
-  deinit {
-    handlerRegistry.cleanup()
-  }
 }
 
 // Application entry point with ArgumentParser
@@ -160,10 +163,12 @@ struct CameraNotifier: ParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "camera-notifier",
     abstract: "macOS camera monitoring with extensible handlers",
-    version: "1.0.0"
+    version: "1.1.0"
   )
 
-  @Option(name: .long, help: "Comma-separated list of handlers to enable (default: switchbot)")
+  @Option(
+    name: .long,
+    help: "Comma-separated list of handlers to enable: switchbot, log (default: switchbot)")
   var handlers: String?
 
   @Flag(name: .shortAndLong, help: "Enable verbose logging")

@@ -16,6 +16,7 @@ public protocol CameraStateHandler {
   func configure() throws
 
   /// Handle a camera state change event
+  /// Called on a serial queue dedicated to this handler, in the order the changes happened.
   /// This method should be non-blocking and handle errors gracefully
   func handleCameraStateChange(_ change: CameraStateChange)
 
@@ -50,27 +51,33 @@ public enum HandlerConfigurationError: Error, LocalizedError {
 
 // Registry for managing multiple camera state handlers
 public class CameraStateHandlerRegistry {
-  private var handlers: [CameraStateHandler] = []
+  private struct Entry {
+    let handler: CameraStateHandler
+    let queue: DispatchQueue
+  }
+
+  private var entries: [Entry] = []
 
   public init() {}
 
   /// Register a new handler
   public func register(_ handler: CameraStateHandler) {
-    handlers.append(handler)
+    let queue = DispatchQueue(label: "camera-notifier.handler.\(handler.name.lowercased())")
+    entries.append(Entry(handler: handler, queue: queue))
   }
 
   /// Get all enabled handlers
   public var enabledHandlers: [CameraStateHandler] {
-    return handlers.filter { $0.isEnabled }
+    return entries.map(\.handler).filter { $0.isEnabled }
   }
 
   /// Configure all registered handlers
   public func configureAll() throws {
     var configurationErrors: [Error] = []
 
-    for handler in handlers {
+    for entry in entries {
       do {
-        try handler.configure()
+        try entry.handler.configure()
       } catch {
         configurationErrors.append(error)
       }
@@ -84,26 +91,27 @@ public class CameraStateHandlerRegistry {
   }
 
   /// Dispatch camera state change to all enabled handlers
+  /// Each handler has its own serial queue: a slow handler never blocks camera monitoring,
+  /// and every handler receives the changes in the order they happened.
   public func handleCameraStateChange(_ change: CameraStateChange) {
-    for handler in enabledHandlers {
-      // Handle each handler asynchronously to prevent blocking
-      DispatchQueue.global(qos: .utility).async {
-        handler.handleCameraStateChange(change)
+    for entry in entries where entry.handler.isEnabled {
+      entry.queue.async {
+        entry.handler.handleCameraStateChange(change)
       }
     }
   }
 
   /// Cleanup all handlers
   public func cleanup() {
-    for handler in handlers {
-      handler.cleanup()
+    for entry in entries {
+      entry.handler.cleanup()
     }
-    handlers.removeAll()
+    entries.removeAll()
   }
 
   /// Get handler names for logging/debugging
   public var handlerNames: [String] {
-    return handlers.map { $0.name }
+    return entries.map { $0.handler.name }
   }
 
   /// Get enabled handler names for logging/debugging
@@ -114,9 +122,15 @@ public class CameraStateHandlerRegistry {
 
 // Utility for logging with timestamps
 public class HandlerLogger {
-  public static func log(_ message: String, handler: String? = nil) {
+  // DateFormatter is thread-safe for formatting; create it once instead of per message
+  private static let formatter: DateFormatter = {
     let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return formatter
+  }()
+
+  public static func log(_ message: String, handler: String? = nil) {
     let timestamp = formatter.string(from: Date())
 
     let logMessage: String
@@ -133,8 +147,6 @@ public class HandlerLogger {
 
   // Error logging to stderr
   public static func logError(_ message: String, handler: String? = nil) {
-    let formatter = DateFormatter()
-    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
     let timestamp = formatter.string(from: Date())
 
     let logMessage: String

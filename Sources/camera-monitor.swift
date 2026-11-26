@@ -1,5 +1,10 @@
 // Camera Monitor Library - Real-time camera usage detection for macOS
-// Uses CoreMediaIO framework to monitor camera device status changes
+// Uses CoreMediaIO to track camera devices and whether any of them is in use.
+//
+// The device list is NOT fixed at startup: a USB camera gets a new CMIOObjectID every time it is
+// re-enumerated (unplug/replug, dock reconnect, sometimes after sleep), and Continuity Camera
+// devices come and go. The monitor therefore combines CoreMediaIO property listeners (low latency)
+// with a periodic rescan (safety net). All state is confined to a single serial dispatch queue.
 
 import CoreMediaIO
 import Foundation
@@ -7,6 +12,7 @@ import Foundation
 // Camera state change information
 public struct CameraStateChange {
   public let isRunning: Bool
+  /// The device in use (ON), or the device that was in use until now (OFF)
   public let deviceName: String?
 
   public init(isRunning: Bool, deviceName: String?) {
@@ -15,135 +21,228 @@ public struct CameraStateChange {
   }
 }
 
-// Camera monitor errors
-public enum CameraMonitorError: Error {
-  case failedToGetDeviceListSize
-  case failedToGetDeviceList
-  case initializationFailed
-}
-
 // Camera monitoring class with callback support
-public class CameraMonitor {
-  private let deviceIDs: [CMIOObjectID]
-  private var lastState: Bool? = false
-
+public final class CameraMonitor {
   public typealias StateChangeCallback = (CameraStateChange) -> Void
 
-  public init() throws {
-    // Get system object ID for CoreMediaIO queries
-    let systemObjectID = CMIOObjectID(kCMIOObjectSystemObject)
-    var dataSize: UInt32 = 0
+  private struct Device {
+    let name: String
+    let uid: String
+    let runningListener: CMIOObjectPropertyListenerBlock?
+  }
 
-    // Configure property address for device list retrieval
-    var deviceListAddress = CMIOObjectPropertyAddress(
-      mSelector: UInt32(kCMIOHardwarePropertyDevices),
-      mScope: UInt32(kCMIOObjectPropertyScopeGlobal),
-      mElement: UInt32(kCMIOObjectPropertyElementMain)
+  private static let logTag = "CameraMonitor"
+  private static let systemObject = CMIOObjectID(kCMIOObjectSystemObject)
+  private static let sleepLogThresholdNanos: UInt64 = 5_000_000_000
+
+  private let queue: DispatchQueue
+  private let pollInterval: TimeInterval
+  private var onStateChange: StateChangeCallback?
+  private var devices: [CMIOObjectID: Device] = [:]
+  private var deviceListListener: CMIOObjectPropertyListenerBlock?
+  private var timer: DispatchSourceTimer?
+  private var deviceListAvailable = true
+  // nil until the first evaluation, so the initial state is always reported (startup sync)
+  private var lastState: Bool?
+  private var lastRunningDeviceName: String?
+  private var lastTotalSleepNanos: UInt64?
+
+  /// - Parameters:
+  ///   - queue: Serial queue on which CoreMediaIO is queried and callbacks are delivered
+  ///   - pollInterval: Interval of the periodic rescan that backs up the CoreMediaIO listeners
+  public init(queue: DispatchQueue = .main, pollInterval: TimeInterval = 1) {
+    self.queue = queue
+    self.pollInterval = pollInterval
+  }
+
+  /// Start monitoring. The current state is reported once right away, then on every change.
+  /// The callback is invoked on the monitor's queue.
+  public func start(onStateChange: @escaping StateChangeCallback) {
+    queue.async {
+      self.onStateChange = onStateChange
+      self.installDeviceListListener()
+      self.refreshDevices()
+      self.log(
+        "Monitoring \(self.devices.count) camera device(s); rescanning every \(self.pollInterval)s"
+      )
+      self.evaluate()
+      self.startTimer()
+    }
+  }
+
+  // MARK: - Periodic rescan
+
+  private func startTimer() {
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(
+      deadline: .now() + pollInterval, repeating: pollInterval, leeway: .milliseconds(100))
+    timer.setEventHandler { [weak self] in
+      self?.tick()
+    }
+    timer.resume()
+    self.timer = timer
+  }
+
+  private func tick() {
+    logIfResumedFromSleep()
+    refreshDevices()
+    evaluate()
+  }
+
+  // CLOCK_MONOTONIC_RAW keeps counting while the system is asleep and CLOCK_UPTIME_RAW does not,
+  // so their difference is the total time spent asleep since boot.
+  private func logIfResumedFromSleep() {
+    let uptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    let monotonic = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+    let totalSleep = monotonic &- uptime
+    defer { lastTotalSleepNanos = totalSleep }
+
+    guard let last = lastTotalSleepNanos, totalSleep > last,
+      totalSleep - last > Self.sleepLogThresholdNanos
+    else { return }
+    let slept = Self.formatDuration(seconds: (totalSleep - last) / 1_000_000_000)
+    log("Resumed after system sleep (slept ~\(slept)), rescanning camera devices")
+  }
+
+  // MARK: - Device tracking
+
+  private func installDeviceListListener() {
+    var address = Self.propertyAddress(kCMIOHardwarePropertyDevices)
+    let listener: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
+      guard let self else { return }
+      self.refreshDevices()
+      self.evaluate()
+    }
+    let status = CMIOObjectAddPropertyListenerBlock(Self.systemObject, &address, queue, listener)
+    if status == noErr {
+      deviceListListener = listener
+    } else {
+      log("Could not register device list listener (OSStatus \(status)), relying on rescan only")
+    }
+  }
+
+  private func refreshDevices() {
+    guard let ids = Self.fetchDeviceIDs() else {
+      if deviceListAvailable {
+        deviceListAvailable = false
+        log("Failed to get camera device list, will keep retrying")
+      }
+      return
+    }
+    if !deviceListAvailable {
+      deviceListAvailable = true
+      log("Camera device list is available again")
+    }
+
+    let current = Set(ids)
+    for (id, device) in devices where !current.contains(id) {
+      removeRunningListener(id: id, listener: device.runningListener)
+      devices[id] = nil
+      log("Camera device removed: \(device.name) [id=\(id)]")
+    }
+    for id in ids where devices[id] == nil {
+      let name = Self.stringProperty(id, kCMIOObjectPropertyName) ?? "(Name not available)"
+      let uid = Self.stringProperty(id, kCMIODevicePropertyDeviceUID) ?? "unknown"
+      devices[id] = Device(name: name, uid: uid, runningListener: addRunningListener(id: id))
+      log("Camera device added: \(name) [id=\(id) uid=\(uid)]")
+    }
+  }
+
+  private func addRunningListener(id: CMIOObjectID) -> CMIOObjectPropertyListenerBlock? {
+    var address = Self.propertyAddress(kCMIODevicePropertyDeviceIsRunningSomewhere)
+    let listener: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
+      self?.evaluate()
+    }
+    let status = CMIOObjectAddPropertyListenerBlock(id, &address, queue, listener)
+    return status == noErr ? listener : nil
+  }
+
+  private func removeRunningListener(id: CMIOObjectID, listener: CMIOObjectPropertyListenerBlock?) {
+    guard let listener else { return }
+    var address = Self.propertyAddress(kCMIODevicePropertyDeviceIsRunningSomewhere)
+    // Fails harmlessly when the device object is already gone
+    _ = CMIOObjectRemovePropertyListenerBlock(id, &address, queue, listener)
+  }
+
+  // MARK: - State evaluation
+
+  private func evaluate() {
+    let runningName = devices.keys.sorted()
+      .first { Self.isRunningSomewhere($0) == true }
+      .flatMap { devices[$0]?.name }
+    let isRunning = runningName != nil
+    defer {
+      if let runningName { lastRunningDeviceName = runningName }
+    }
+
+    guard isRunning != lastState else { return }
+    lastState = isRunning
+    let deviceName = isRunning ? runningName : lastRunningDeviceName
+    log("Camera state changed: \(isRunning ? "ON" : "OFF") - Device: \(deviceName ?? "unknown")")
+    onStateChange?(CameraStateChange(isRunning: isRunning, deviceName: deviceName))
+  }
+
+  // MARK: - CoreMediaIO helpers
+
+  private static func propertyAddress<T: BinaryInteger>(_ selector: T) -> CMIOObjectPropertyAddress
+  {
+    CMIOObjectPropertyAddress(
+      mSelector: CMIOObjectPropertySelector(selector),
+      mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+      mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
     )
+  }
 
-    // Get the size of device list data
-    guard
-      CMIOObjectGetPropertyDataSize(systemObjectID, &deviceListAddress, 0, nil, &dataSize) == noErr
-    else {
-      throw CameraMonitorError.failedToGetDeviceListSize
+  private static func fetchDeviceIDs() -> [CMIOObjectID]? {
+    var address = propertyAddress(kCMIOHardwarePropertyDevices)
+    var dataSize: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(systemObject, &address, 0, nil, &dataSize) == noErr else {
+      return nil
     }
 
-    // Calculate number of devices and prepare array to store device IDs
-    let numberOfDevices = Int(dataSize) / MemoryLayout<CMIOObjectID>.size
-    var deviceIDs = [CMIOObjectID](repeating: 0, count: numberOfDevices)
+    let capacity = Int(dataSize) / MemoryLayout<CMIOObjectID>.size
+    guard capacity > 0 else { return [] }
+    var ids = [CMIOObjectID](repeating: 0, count: capacity)
     var dataUsed: UInt32 = 0
-
-    // Retrieve the actual device ID list
     guard
-      CMIOObjectGetPropertyData(
-        systemObjectID, &deviceListAddress, 0, nil, dataSize, &dataUsed, &deviceIDs
-      ) == noErr
+      CMIOObjectGetPropertyData(systemObject, &address, 0, nil, dataSize, &dataUsed, &ids) == noErr
     else {
-      throw CameraMonitorError.failedToGetDeviceList
+      return nil
     }
-
-    self.deviceIDs = deviceIDs
+    return Array(ids.prefix(Int(dataUsed) / MemoryLayout<CMIOObjectID>.size))
   }
 
-  // Check if any camera device is currently running
-  public func checkCameraState() -> CameraStateChange {
-    for deviceID in deviceIDs {
-      // Get device name
-      var nameAddress = CMIOObjectPropertyAddress(
-        mSelector: UInt32(kCMIOObjectPropertyName),
-        mScope: UInt32(kCMIOObjectPropertyScopeGlobal),
-        mElement: UInt32(kCMIOObjectPropertyElementMain)
-      )
-      var deviceName: Unmanaged<CFString>?
-      var nameUsed: UInt32 = 0
-      let nameStatus = CMIOObjectGetPropertyData(
-        deviceID, &nameAddress, 0, nil, UInt32(MemoryLayout<CFString?>.size), &nameUsed, &deviceName
-      )
-      let nameStr =
-        (nameStatus == noErr && deviceName != nil)
-        ? deviceName!.takeRetainedValue() as String
-        : "(Name not available)"
-
-      // Check if device is currently running
-      var isRunningAddress = CMIOObjectPropertyAddress(
-        mSelector: UInt32(kCMIODevicePropertyDeviceIsRunningSomewhere),
-        mScope: UInt32(kCMIOObjectPropertyScopeGlobal),
-        mElement: UInt32(kCMIOObjectPropertyElementMain)
-      )
-      var isRunning: UInt32 = 0
-      var isRunningUsed: UInt32 = 0
-      let isRunningStatus = CMIOObjectGetPropertyData(
-        deviceID, &isRunningAddress, 0, nil, UInt32(MemoryLayout<UInt32>.size), &isRunningUsed,
-        &isRunning
-      )
-
-      if isRunningStatus == noErr && isRunning != 0 {
-        return CameraStateChange(isRunning: true, deviceName: nameStr)
-      }
-    }
-    return CameraStateChange(isRunning: false, deviceName: nil)
+  private static func stringProperty<T: BinaryInteger>(_ id: CMIOObjectID, _ selector: T)
+    -> String?
+  {
+    var address = propertyAddress(selector)
+    var value: Unmanaged<CFString>?
+    var dataUsed: UInt32 = 0
+    let status = CMIOObjectGetPropertyData(
+      id, &address, 0, nil, UInt32(MemoryLayout<Unmanaged<CFString>?>.size), &dataUsed, &value)
+    guard status == noErr, let value else { return nil }
+    // CMIO string properties follow the copy rule: the caller owns the returned CFString
+    return value.takeRetainedValue() as String
   }
 
-  // Monitor camera state changes and call callback on changes
-  public func startMonitoring(interval: UInt32 = 1, onStateChange: @escaping StateChangeCallback) {
-    logMessage("Camera monitoring loop started with \(deviceIDs.count) devices")
-
-    while true {
-      let currentState = checkCameraState()
-
-      // Only call callback on state changes
-      if lastState == nil || lastState != currentState.isRunning {
-        logMessage(
-          "Camera state changed: \(currentState.isRunning ? "ON" : "OFF") - Device: \(currentState.deviceName ?? "unknown")"
-        )
-        onStateChange(currentState)
-        lastState = currentState.isRunning
-      }
-
-      sleep(interval)
-    }
+  private static func isRunningSomewhere(_ id: CMIOObjectID) -> Bool? {
+    var address = propertyAddress(kCMIODevicePropertyDeviceIsRunningSomewhere)
+    var value: UInt32 = 0
+    var dataUsed: UInt32 = 0
+    let status = CMIOObjectGetPropertyData(
+      id, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &dataUsed, &value)
+    return status == noErr ? value != 0 : nil
   }
 
-  // Helper method for logging with forced flush
-  private func logMessage(_ message: String) {
-    let formatter = DateFormatter()
-    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    let timestamp = formatter.string(from: Date())
-    let logMsg = "[\(timestamp)] [CameraMonitor] \(message)"
-
-    print(logMsg)
-    fflush(stdout)
+  private static func formatDuration(seconds: UInt64) -> String {
+    let hours = seconds / 3600
+    let minutes = (seconds % 3600) / 60
+    if hours > 0 { return "\(hours)h\(minutes)m" }
+    if minutes > 0 { return "\(minutes)m\(seconds % 60)s" }
+    return "\(seconds)s"
   }
 
-  // Single check without monitoring loop - useful for polling from external loop
-  public func checkForStateChange() -> CameraStateChange? {
-    let currentState = checkCameraState()
-
-    if lastState == nil || lastState != currentState.isRunning {
-      lastState = currentState.isRunning
-      return currentState
-    }
-
-    return nil
+  private func log(_ message: String) {
+    HandlerLogger.log(message, handler: Self.logTag)
   }
 }

@@ -12,18 +12,19 @@ This is a macOS camera monitoring utility with extensible handler system for aut
 
 **camera-monitor.swift**: CameraMonitor library that:
 
-- Provides a `CameraMonitor` class for real-time camera monitoring
+- Provides a `CameraMonitor` class for real-time camera monitoring (`start(onStateChange:)`)
 - Uses CoreMediaIO framework for low-level camera device access
-- Offers callback-based state change notifications
-- Supports both continuous monitoring and polling modes
-- Handles device enumeration and state checking
+- Tracks the device list dynamically: cameras connected or re-enumerated after startup are picked up
+- Combines CoreMediaIO property listeners with a periodic rescan (every 1s) as a safety net
+- Reports the current state once at startup, then every change, on a serial queue (main by default)
+- Logs device add/remove and wake from sleep for diagnostics
 
 **camera-state-handler.swift**: Handler protocol and registry system that:
 
 - Defines `CameraStateHandler` protocol for all camera state handlers
 - Provides `CameraStateHandlerRegistry` for managing multiple handlers
 - Includes `HandlerLogger` utility for timestamped logging
-- Supports async dispatch to prevent blocking
+- Dispatches to each handler on its own serial queue (non-blocking, in order)
 - Handles configuration errors and validation
 
 **switchbot-sync.swift**: SwitchBot integration handler that:
@@ -32,15 +33,18 @@ This is a macOS camera monitoring utility with extensible handler system for aut
 - Automatically controls SwitchBot Plug devices when camera state changes
 - Uses SwitchBot Cloud API v1.1 with HMAC-SHA256 authentication
 - Supports auto-detection of available devices
-- Includes comprehensive error handling
+- Sends one command at a time (only the latest state), retrying failures with backoff
 
 **camera-notifier.swift**: Main application entry point that:
 
 - Uses Swift Argument Parser for type-safe CLI argument parsing
 - Supports --handlers and --verbose command-line options
 - Environment variable configuration system
-- Signal handling for graceful shutdown (SIGINT, SIGTERM)
+- Signal handling for graceful shutdown (SIGINT, SIGTERM) via dispatch signal sources
 - Registry-based handler management
+- Runs the main run loop; everything after startup is event driven
+
+**log-handler.swift**: Log-only handler (`--handlers log`) that prints camera state changes without side effects
 
 ## Project Structure
 
@@ -51,6 +55,7 @@ camera-notifier/
 │   ├── camera-monitor.swift      # Camera monitoring library
 │   ├── camera-state-handler.swift # Handler protocol and registry
 │   ├── switchbot-sync.swift      # SwitchBot integration handler
+│   ├── log-handler.swift         # Log-only handler (diagnostics)
 │   └── camera-notifier.swift     # Main application entry point
 ├── .build/release/camera-notifier # Compiled binary (SPM output)
 ├── Makefile                      # Build configuration
@@ -91,6 +96,9 @@ swift build -c release
 ./.build/release/camera-notifier --verbose
 ./.build/release/camera-notifier --handlers switchbot
 
+# Check camera detection only, without controlling any device
+./.build/release/camera-notifier --handlers log
+
 # Run with environment variables
 SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./.build/release/camera-notifier
 ```
@@ -99,7 +107,7 @@ SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./.build/release/cam
 
 ### Command Line Arguments (via Swift Argument Parser)
 
-- `--handlers <handlers>`: Comma-separated list of handlers to enable (default: "switchbot")
+- `--handlers <handlers>`: Comma-separated list of handlers to enable: `switchbot`, `log` (default: "switchbot")
 - `--verbose` / `-v`: Enable verbose logging
 - `--help` / `-h`: Show help information
 - `--version`: Show version information
@@ -120,15 +128,20 @@ SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./.build/release/cam
 ### Camera Monitoring
 
 - Uses CoreMediaIO framework for low-level camera device access
-- Polls device state every second using `kCMIODevicePropertyDeviceIsRunningSomewhere`
-- Callback-based architecture for state change notifications
-- Requires camera permissions in macOS System Preferences
+- A camera is "in use" when `kCMIODevicePropertyDeviceIsRunningSomewhere` is non-zero for any device
+- The device list (`kCMIOHardwarePropertyDevices`) must never be cached for the process lifetime:
+  a USB camera gets a new `CMIOObjectID` whenever it is re-enumerated (unplug/replug, dock
+  reconnect, sometimes after sleep). Caching it made the tool stop reacting until restarted.
+- `CMIOObjectAddPropertyListenerBlock` listeners on the device list and on each device give low
+  latency; a 1s `DispatchSourceTimer` rescans and re-evaluates as a safety net
+- Wake from sleep is detected (for logging) by comparing `CLOCK_MONOTONIC_RAW` and `CLOCK_UPTIME_RAW`
+- The main thread runs `RunLoop.main.run()`; nothing may block it
 
 ### Handler System
 
 - Protocol-based design allows easy extension
 - Registry pattern manages multiple handlers
-- Async dispatch prevents blocking on slow operations
+- Each handler gets its own serial queue: slow handlers never block monitoring, and changes arrive in order
 - Configuration validation with meaningful error messages
 
 ### SwitchBot Integration
@@ -136,8 +149,13 @@ SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./.build/release/cam
 - Uses SwitchBot Cloud API v1.1 with HMAC-SHA256 authentication
 - Automatically turns plug ON when camera starts
 - Automatically turns plug OFF when camera stops
+- Syncs the plug with the current camera state at startup
 - Auto-detection of available devices if device ID not specified
-- Comprehensive error handling and logging
+- One request in flight at a time; if the state changes meanwhile, only the latest state is sent
+- Retries with exponential backoff (2s up to 60s, max 8 attempts) on network errors, HTTP 429/5xx,
+  and API statusCode 161/171/190; not on 401 or other client errors
+- `URLSession` with `waitsForConnectivity` so requests right after wake wait for the network
+- Checks both the HTTP status and the API `statusCode` (100 = success)
 
 ### Build System
 
@@ -182,10 +200,11 @@ if config.enabledHandlers.contains("slack") {
 
 ## Troubleshooting
 
-### Camera Permissions
+### Camera Detection
 
-- Grant access in System Preferences → Security & Privacy → Camera
-- App needs to be in the allowed applications list
+- Run `./.build/release/camera-notifier --handlers log` and check for `Camera device added` lines
+  and `Camera state changed` when an app starts or stops using the camera
+- If no devices are listed, check System Settings → Privacy & Security → Camera
 
 ### SwitchBot API Issues
 
@@ -203,6 +222,8 @@ if config.enabledHandlers.contains("slack") {
 ### Runtime Issues
 
 - Use `--verbose` flag or `VERBOSE=1` environment variable for detailed logging
+- `Camera device added/removed` and `Resumed after system sleep` lines show device re-enumeration
+- `Device control failed ... retrying in Ns` / `giving up` lines show SwitchBot delivery problems
 - Check environment variable names and values
 - Verify handler names in `--handlers` option or `CAMERA_HANDLERS` are spelled correctly
 - Use Ctrl+C for graceful shutdown
@@ -233,31 +254,37 @@ To run camera-notifier automatically at startup as a background service:
 
 4. **Load Service**:
    ```bash
-   launchctl load ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+   chmod 600 ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
    ```
 
 5. **Verify Service**:
    ```bash
-   launchctl list | grep camera-notifier
+   launchctl print gui/$(id -u)/com.sugyan.camera-notifier
    tail -f /tmp/camera-notifier.log
    ```
+
+`scripts/install-launchd.sh` performs all of the above (build, plist generation, chmod, bootout/bootstrap).
+The plist stores the absolute binary path, so re-run it after moving the repository.
 
 ### Service Management Commands
 
 ```bash
-# Start service
-launchctl start com.sugyan.camera-notifier
+# Status
+launchctl print gui/$(id -u)/com.sugyan.camera-notifier
 
-# Stop service
-launchctl stop com.sugyan.camera-notifier
+# Restart (e.g. after rebuilding the binary)
+launchctl kickstart -k gui/$(id -u)/com.sugyan.camera-notifier
 
-# Unload service (disable auto-start)
-launchctl unload ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+# Stop (until next login or bootstrap)
+launchctl bootout gui/$(id -u)/com.sugyan.camera-notifier
 
-# Reload service after config changes
-launchctl unload ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
-launchctl load ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+# Reload service after plist changes
+launchctl bootout gui/$(id -u)/com.sugyan.camera-notifier
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
 ```
+
+Note: with `KeepAlive`, the legacy `launchctl stop` only restarts the job.
 
 ### Log Files
 
