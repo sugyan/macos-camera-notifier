@@ -9,9 +9,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PLIST_TEMPLATE="$PROJECT_DIR/launchd/com.sugyan.camera-notifier.plist.template"
 LABEL="com.sugyan.camera-notifier"
-PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_DEST="$PLIST_DIR/$LABEL.plist"
 BINARY_PATH="$PROJECT_DIR/.build/release/camera-notifier"
 DOMAIN="gui/$(id -u)"
+SERVICE="$DOMAIN/$LABEL"
+# `launchctl print` also prints the job's environment, i.e. the SwitchBot token and secret:
+# only ever show these lines of it
+STATUS_FILTER='^[[:space:]]*(state|pid|program|last exit code) = '
 
 echo "🔧 Camera Notifier - launchd Setup"
 echo "=================================="
@@ -61,67 +66,112 @@ fi
 echo "✅ Binary found at $BINARY_PATH"
 
 # Create LaunchAgents directory if it doesn't exist
-mkdir -p "$HOME/Library/LaunchAgents"
+mkdir -p "$PLIST_DIR"
 
 # Generate plist from template
 echo "📝 Generating plist configuration..."
 
-# Handle optional SWITCHBOT_DEVICE_ID
-if [[ -n "$SWITCHBOT_DEVICE_ID" && "$SWITCHBOT_DEVICE_ID" != "" ]]; then
-    DEVICE_ID_LINE="<key>SWITCHBOT_DEVICE_ID</key>
-		<string>$SWITCHBOT_DEVICE_ID</string>"
+# Handle optional SWITCHBOT_DEVICE_ID (on one line: a sed replacement cannot contain a newline)
+if [[ -n "$SWITCHBOT_DEVICE_ID" ]]; then
+    DEVICE_ID_LINE="<key>SWITCHBOT_DEVICE_ID</key><string>$SWITCHBOT_DEVICE_ID</string>"
     echo "  Using specified device ID: $SWITCHBOT_DEVICE_ID"
 else
     DEVICE_ID_LINE=""
     echo "  No device ID specified, will use auto-detection"
 fi
 
-sed "s|{{BINARY_PATH}}|$BINARY_PATH|g; \
-     s|{{SWITCHBOT_TOKEN}}|${SWITCHBOT_TOKEN}|g; \
-     s|{{SWITCHBOT_SECRET}}|${SWITCHBOT_SECRET}|g; \
-     s|{{SWITCHBOT_DEVICE_ID_LINE}}|${DEVICE_ID_LINE}|g" \
-    "$PLIST_TEMPLATE" > "$PLIST_DEST"
+# Escape a value for the replacement part of a sed s||| command
+sed_escape() {
+    printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'
+}
 
-# The plist contains the API token and secret: keep it private
-chmod 600 "$PLIST_DEST"
+# Build the new plist in private temporary files (mktemp creates them with mode 600) and replace
+# the installed one only once the result is valid: a failure never leaves a broken or empty plist.
+# The sed script is written with printf (a builtin), so the secrets never appear in `ps`.
+SED_SCRIPT="$(mktemp)"
+TMP_PLIST="$(mktemp "$PLIST_DIR/.$LABEL.XXXXXX")"
+trap 'rm -f "$SED_SCRIPT" "$TMP_PLIST"' EXIT
+
+{
+    printf 's|{{BINARY_PATH}}|%s|g\n' "$(sed_escape "$BINARY_PATH")"
+    printf 's|{{SWITCHBOT_TOKEN}}|%s|g\n' "$(sed_escape "$SWITCHBOT_TOKEN")"
+    printf 's|{{SWITCHBOT_SECRET}}|%s|g\n' "$(sed_escape "$SWITCHBOT_SECRET")"
+    printf 's|{{SWITCHBOT_DEVICE_ID_LINE}}|%s|g\n' "$(sed_escape "$DEVICE_ID_LINE")"
+} > "$SED_SCRIPT"
+sed -f "$SED_SCRIPT" "$PLIST_TEMPLATE" > "$TMP_PLIST"
+
+if ! plutil -lint -s "$TMP_PLIST"; then
+    echo "❌ Error: the generated plist is invalid; $PLIST_DEST was left unchanged"
+    exit 1
+fi
+mv -f "$TMP_PLIST" "$PLIST_DEST"
 
 echo "✅ Created plist at $PLIST_DEST"
 
-# Unload existing service if it exists
-if launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; then
+# Unload the existing service and wait until launchd has removed it: bootstrap fails while the
+# old instance is still being torn down
+if launchctl print "$SERVICE" > /dev/null 2>&1; then
     echo "🔄 Unloading existing service..."
-    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    bootout_output=$(launchctl bootout "$SERVICE" 2>&1) || true
+    for ((i = 0; i < 30; i++)); do
+        launchctl print "$SERVICE" > /dev/null 2>&1 || break
+        sleep 0.5
+    done
+    if launchctl print "$SERVICE" > /dev/null 2>&1; then
+        echo "❌ Error: the existing service is still loaded after 15s${bootout_output:+ ($bootout_output)}"
+        echo "   The new plist is installed; run this script again in a moment, or unload the"
+        echo "   service with 'launchctl bootout $SERVICE' first"
+        exit 1
+    fi
 fi
 
-# Load the service (retry briefly: bootstrap can fail while the old instance is still exiting)
+# Load the service (retry briefly in case launchd is still busy with the old instance)
 echo "🚀 Loading service..."
+loaded=false
 for _ in 1 2 3 4 5; do
-    if launchctl bootstrap "$DOMAIN" "$PLIST_DEST" 2>/dev/null; then
+    if bootstrap_output=$(launchctl bootstrap "$DOMAIN" "$PLIST_DEST" 2>&1); then
+        loaded=true
         break
     fi
     sleep 1
 done
 
+if [[ "$loaded" != true ]]; then
+    echo "❌ Failed to load service: ${bootstrap_output:-unknown error}"
+    if launchctl print-disabled "$DOMAIN" 2>/dev/null | grep -qE "\"$LABEL\" => (true|disabled)"; then
+        echo "   The service is disabled. Enable it with: launchctl enable $SERVICE"
+    else
+        echo "   Check that camera-notifier is allowed in System Settings → General → Login Items & Extensions"
+    fi
+    echo "   Then run: launchctl bootstrap $DOMAIN $PLIST_DEST"
+    exit 1
+fi
+
 # Verify service is running
 sleep 2
-if launchctl print "$DOMAIN/$LABEL" > /dev/null 2>&1; then
-    echo "✅ Service loaded successfully!"
-    echo ""
-    echo "📊 Service Status:"
-    launchctl print "$DOMAIN/$LABEL" | grep -E "^\s*(state|pid|program|last exit code) =" || true
-    echo ""
-    echo "📁 Log Files:"
-    echo "   Output: /tmp/camera-notifier.log"
-    echo "   Errors: /tmp/camera-notifier-error.log"
-    echo ""
-    echo "🎯 Commands:"
-    echo "   Status:  launchctl print $DOMAIN/$LABEL"
-    echo "   Restart: launchctl kickstart -k $DOMAIN/$LABEL"
-    echo "   Stop:    launchctl bootout $DOMAIN/$LABEL"
-    echo "   Start:   launchctl bootstrap $DOMAIN $PLIST_DEST"
-    echo "   Logs:    tail -f /tmp/camera-notifier.log"
-else
-    echo "❌ Failed to load service"
+status=$(launchctl print "$SERVICE" 2>/dev/null | grep -E "$STATUS_FILTER" || true)
+if [[ -z "$status" ]]; then
+    echo "❌ The service was loaded but is no longer registered"
     echo "Check the error log: /tmp/camera-notifier-error.log"
     exit 1
 fi
+
+echo "✅ Service loaded successfully!"
+echo ""
+echo "📊 Service Status:"
+echo "$status"
+if ! grep -qE 'state = running' <<< "$status"; then
+    echo "⚠️  The service is not running; check /tmp/camera-notifier-error.log"
+fi
+echo ""
+echo "📁 Log Files:"
+echo "   Output: /tmp/camera-notifier.log"
+echo "   Errors: /tmp/camera-notifier-error.log"
+echo ""
+echo "🎯 Commands:"
+echo "   Status:  launchctl print $SERVICE | grep -E '$STATUS_FILTER'"
+echo "            (plain 'launchctl print' also shows the SwitchBot token and secret)"
+echo "   Restart: launchctl kickstart -k $SERVICE"
+echo "   Stop:    launchctl bootout $SERVICE"
+echo "   Start:   launchctl bootstrap $DOMAIN $PLIST_DEST"
+echo "   Logs:    tail -f /tmp/camera-notifier.log"

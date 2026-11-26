@@ -6,10 +6,13 @@ import Foundation
 
 // Main application configuration
 struct AppConfig {
+  static let defaultOffDelay: TimeInterval = 5
+
   let enabledHandlers: Set<String>
   let verboseLogging: Bool
+  let offDelay: TimeInterval
 
-  init(handlers: String? = nil, verbose: Bool = false) {
+  init(handlers: String? = nil, verbose: Bool = false, offDelay: TimeInterval? = nil) {
     // Parse enabled handlers from parameter or environment variable
     let handlersEnv =
       handlers ?? ProcessInfo.processInfo.environment["CAMERA_HANDLERS"] ?? "switchbot"
@@ -19,6 +22,13 @@ struct AppConfig {
 
     // Enable verbose logging if requested
     self.verboseLogging = verbose || ProcessInfo.processInfo.environment["VERBOSE"] == "1"
+
+    // Seconds without camera use before OFF is reported; invalid values fall back to the default
+    let offDelayEnv = ProcessInfo.processInfo.environment["CAMERA_OFF_DELAY"].flatMap(Double.init)
+    let requestedOffDelay = offDelay ?? offDelayEnv ?? Self.defaultOffDelay
+    self.offDelay =
+      requestedOffDelay.isFinite && requestedOffDelay >= 0
+      ? requestedOffDelay : Self.defaultOffDelay
   }
 }
 
@@ -26,12 +36,16 @@ struct AppConfig {
 class CameraNotifierApp {
   private let config: AppConfig
   private let handlerRegistry: CameraStateHandlerRegistry
-  private let cameraMonitor = CameraMonitor()
+  private let cameraMonitor: CameraMonitor
   private var signalSources: [DispatchSourceSignal] = []
+  private var powerObserver: SystemPowerObserver?
 
   init(config: AppConfig) {
     self.config = config
     self.handlerRegistry = CameraStateHandlerRegistry()
+    // The monitor runs on its own queue: the main thread only handles signals, so Ctrl+C and
+    // SIGTERM keep working even if a CoreMediaIO call hangs
+    self.cameraMonitor = CameraMonitor(offDelay: config.offDelay)
 
     registerAvailableHandlers()
   }
@@ -45,11 +59,39 @@ class CameraNotifierApp {
       let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
       source.setEventHandler { [weak self] in
         HandlerLogger.log("Received \(description) signal, shutting down...")
-        self?.handlerRegistry.cleanup()
-        exit(0)
+        self?.shutdown()
       }
       source.resume()
       signalSources.append(source)
+    }
+  }
+
+  private func shutdown() {
+    // An OFF still waiting for the off delay would otherwise be lost (e.g. at logout); the
+    // handlers then get a few seconds to deliver it
+    cameraMonitor.flushPendingOff()
+    handlerRegistry.cleanup()
+    exit(0)
+  }
+
+  // Right before the system sleeps, send an OFF that is still waiting for the off delay: the
+  // process is suspended during sleep. Sleep waits for this, so it is bounded to a few seconds.
+  private func startPowerObserver() {
+    let observer = SystemPowerObserver(
+      queue: DispatchQueue(label: "camera-notifier.power"),
+      willSleep: { [cameraMonitor, handlerRegistry] in
+        cameraMonitor.systemWillSleep()
+        handlerRegistry.flush(timeout: 3)
+      },
+      didWake: { [cameraMonitor] in
+        cameraMonitor.systemDidWake()
+      })
+    if observer.start() {
+      powerObserver = observer
+    } else {
+      HandlerLogger.log(
+        "Could not register for sleep notifications; an OFF right before sleep may be sent after wake"
+      )
     }
   }
 
@@ -81,6 +123,7 @@ class CameraNotifierApp {
     // Display configuration
     HandlerLogger.log("Enabled handlers: \(config.enabledHandlers.joined(separator: ", "))")
     HandlerLogger.log("Verbose logging: \(config.verboseLogging)")
+    HandlerLogger.log("Off delay: \(config.offDelay)s")
     HandlerLogger.log(
       "Registered handlers: \(handlerRegistry.handlerNames.joined(separator: ", "))")
 
@@ -117,6 +160,7 @@ class CameraNotifierApp {
     HandlerLogger.log("Active handlers: \(enabledHandlers.joined(separator: ", "))")
 
     setupSignalHandlers()
+    startPowerObserver()
 
     // Start monitoring with handler dispatch
     cameraMonitor.start { [handlerRegistry] change in
@@ -140,6 +184,7 @@ class CameraNotifierApp {
       - CAMERA_HANDLERS: Comma-separated list of handlers to enable (default: "switchbot")
         Available handlers: switchbot, log (log only prints camera state changes)
       - VERBOSE: Set to "1" for verbose logging
+      - CAMERA_OFF_DELAY: Seconds without camera use before OFF is reported (default: 5)
 
       SwitchBot Handler:
       - SWITCHBOT_TOKEN: Your SwitchBot API token (required)
@@ -150,7 +195,7 @@ class CameraNotifierApp {
       export CAMERA_HANDLERS="switchbot"
       export SWITCHBOT_TOKEN="your_token_here"
       export SWITCHBOT_SECRET="your_secret_here"
-      ./camera-notifier
+      ./.build/release/camera-notifier
 
       """, stderr)
     fflush(stderr)
@@ -174,8 +219,19 @@ struct CameraNotifier: ParsableCommand {
   @Flag(name: .shortAndLong, help: "Enable verbose logging")
   var verbose: Bool = false
 
+  @Option(
+    name: .long,
+    help: "Seconds without camera use before OFF is reported (default: 5, env: CAMERA_OFF_DELAY)")
+  var offDelay: Double?
+
+  mutating func validate() throws {
+    if let offDelay, !(offDelay.isFinite && offDelay >= 0) {
+      throw ValidationError("--off-delay must be a non-negative number of seconds")
+    }
+  }
+
   mutating func run() throws {
-    let config = AppConfig(handlers: handlers, verbose: verbose)
+    let config = AppConfig(handlers: handlers, verbose: verbose, offDelay: offDelay)
     let app = CameraNotifierApp(config: config)
     app.run()
   }

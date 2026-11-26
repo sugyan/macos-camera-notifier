@@ -10,6 +10,7 @@ Automatically turns SwitchBot plugs ON when camera starts and OFF when camera st
 
 - 🎥 **Real-time camera monitoring** using CoreMediaIO property listeners, backed by a periodic rescan
 - 🔁 **Hot-plug aware**: cameras connected after startup (USB replug, dock reconnect, Continuity Camera) and cameras re-enumerated after sleep are picked up automatically
+- ⏱️ **No flicker**: OFF is reported only after no camera has been in use for 5 seconds (configurable), so an app briefly restarting its camera (e.g. a meeting app going from preview to the call) does not toggle the plug. A pending OFF is still sent right before sleep or shutdown
 - 🔌 **SwitchBot device control** with automatic device detection, in-order delivery (only the latest state is sent) and retries on failure
 - 🚀 **macOS auto-start support** via launchd background service
 - 📊 **Comprehensive logging** of camera state, device add/remove and wake from sleep
@@ -92,7 +93,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sugyan.camera-notifi
 
 ```bash
 # Check service status
-launchctl print gui/$(id -u)/com.sugyan.camera-notifier
+# (filtered: plain `launchctl print` also shows the SwitchBot token and secret)
+launchctl print gui/$(id -u)/com.sugyan.camera-notifier | grep -E '^[[:space:]]*(state|pid|program|last exit code) = '
 
 # View logs
 tail -f /tmp/camera-notifier.log
@@ -121,6 +123,9 @@ make run
 # Log camera state changes only (no SwitchBot)
 ./.build/release/camera-notifier --handlers log
 
+# Report OFF 2 seconds after the camera stops instead of 5
+./.build/release/camera-notifier --off-delay 2
+
 # Show help
 ./.build/release/camera-notifier --help
 ```
@@ -133,10 +138,10 @@ make run
 [2026-01-15 10:30:46] Active handlers: SwitchBot
 [2026-01-15 10:30:46] Camera monitoring started. Press Ctrl+C to stop.
 [2026-01-15 10:30:46] [CameraMonitor] Camera device added: FaceTime HD Camera [id=34 uid=...]
-[2026-01-15 10:30:46] [CameraMonitor] Monitoring 1 camera device(s); rescanning every 1.0s
-[2026-01-15 10:30:46] [CameraMonitor] Camera state changed: OFF - Device: unknown
-[2026-01-15 10:30:46] [SwitchBot] Camera stopped: Unknown device, sending turnOff command
-[2026-01-15 10:30:47] [SwitchBot] Device control success: turnOff (success)
+[2026-01-15 10:30:46] [CameraMonitor] Monitoring 1 camera device(s); rescanning every 1.0s, reporting OFF after 5.0s without camera use
+[2026-01-15 10:30:51] [CameraMonitor] Camera state changed: OFF - Device: unknown
+[2026-01-15 10:30:51] [SwitchBot] Camera stopped: Unknown device, sending turnOff command
+[2026-01-15 10:30:52] [SwitchBot] Device control success: turnOff (success)
 [2026-01-15 10:31:12] [CameraMonitor] Camera state changed: ON - Device: FaceTime HD Camera
 [2026-01-15 10:31:12] [SwitchBot] Camera started: FaceTime HD Camera, sending turnOn command
 [2026-01-15 10:31:13] [SwitchBot] Device control success: turnOn (success)
@@ -153,6 +158,7 @@ make run
 | `SWITCHBOT_SECRET`    | SwitchBot API secret                       | Yes      |
 | `SWITCHBOT_DEVICE_ID` | Target device ID (auto-detects if not set) | No       |
 | `CAMERA_HANDLERS`     | Handlers to enable: `switchbot`, `log` (default: `switchbot`) | No |
+| `CAMERA_OFF_DELAY`    | Seconds without camera use before OFF is reported (default: `5`, or `--off-delay`) | No |
 | `VERBOSE`             | Enable verbose logging (set to `1`)        | No       |
 
 ## Troubleshooting
@@ -181,7 +187,7 @@ tail -f /tmp/camera-notifier.log
 tail -f /tmp/camera-notifier-error.log
 
 # Check service status
-launchctl list | grep camera-notifier
+launchctl print gui/$(id -u)/com.sugyan.camera-notifier | grep -E '^[[:space:]]*(state|pid|program|last exit code) = '
 ```
 
 ### Common Issues
@@ -189,6 +195,7 @@ launchctl list | grep camera-notifier
 - **Service not starting**: Check environment variables in plist file
 - **Service runs an old binary**: The plist stores the absolute binary path; re-run `./scripts/install-launchd.sh` after moving the repository
 - **Plug not switching**: Look for `Device control failed` lines; failed commands are retried with backoff (up to 8 attempts)
+- **Plug turns off a few seconds late**: Intended, see `CAMERA_OFF_DELAY`; a shorter delay makes brief camera restarts toggle the plug
 - **API errors**: Validate SwitchBot token/secret in mobile app
 
 ## Build Commands

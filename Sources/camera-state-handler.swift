@@ -20,12 +20,20 @@ public protocol CameraStateHandler {
   /// This method should be non-blocking and handle errors gracefully
   func handleCameraStateChange(_ change: CameraStateChange)
 
-  /// Optional cleanup when the handler is no longer needed
+  /// Deliver pending work right away and wait for it, at most `timeout` seconds.
+  /// Called right before the system sleeps (the process is suspended afterwards).
+  func flush(timeout: TimeInterval)
+
+  /// Cleanup before the process exits. May block for a few seconds to finish pending work.
   func cleanup()
 }
 
 // Default implementations for optional methods
 extension CameraStateHandler {
+  public func flush(timeout: TimeInterval) {
+    // Default: nothing pending
+  }
+
   public func cleanup() {
     // Default: no cleanup needed
   }
@@ -101,12 +109,24 @@ public class CameraStateHandlerRegistry {
     }
   }
 
-  /// Cleanup all handlers
+  /// Let every handler deliver pending work before the system sleeps, waiting at most `timeout`
+  public func flush(timeout: TimeInterval) {
+    let deadline = Date().addingTimeInterval(timeout)
+    for entry in entries where entry.handler.isEnabled {
+      // Changes dispatched before this call reach the handler first
+      entry.queue.sync {}
+      entry.handler.flush(timeout: max(0, deadline.timeIntervalSinceNow))
+    }
+  }
+
+  /// Cleanup all handlers before the process exits
+  /// (`entries` is only modified during startup, so this is safe while changes are dispatched)
   public func cleanup() {
     for entry in entries {
+      // Changes dispatched before this call reach the handler first
+      entry.queue.sync {}
       entry.handler.cleanup()
     }
-    entries.removeAll()
   }
 
   /// Get handler names for logging/debugging

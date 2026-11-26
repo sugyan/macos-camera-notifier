@@ -5,6 +5,10 @@
 // re-enumerated (unplug/replug, dock reconnect, sometimes after sleep), and Continuity Camera
 // devices come and go. The monitor therefore combines CoreMediaIO property listeners (low latency)
 // with a periodic rescan (safety net). All state is confined to a single serial dispatch queue.
+//
+// ON is reported as soon as a camera is in use. OFF is reported only once no camera has been in use
+// for `offDelay`: apps often stop capturing for a moment (a meeting app going from its preview to
+// the call, switching cameras), and that must not turn the light off and on again.
 
 import CoreMediaIO
 import Foundation
@@ -25,49 +29,101 @@ public struct CameraStateChange {
 public final class CameraMonitor {
   public typealias StateChangeCallback = (CameraStateChange) -> Void
 
-  private struct Device {
-    let name: String
-    let uid: String
-    let runningListener: CMIOObjectPropertyListenerBlock?
-  }
-
   private static let logTag = "CameraMonitor"
   private static let systemObject = CMIOObjectID(kCMIOObjectSystemObject)
   private static let sleepLogThresholdNanos: UInt64 = 5_000_000_000
 
   private let queue: DispatchQueue
   private let pollInterval: TimeInterval
+  private let offDelay: TimeInterval
   private var onStateChange: StateChangeCallback?
-  private var devices: [CMIOObjectID: Device] = [:]
-  private var deviceListListener: CMIOObjectPropertyListenerBlock?
+  // Device names by object ID
+  private var devices: [CMIOObjectID: String] = [:]
+  // Devices that have a running-state listener. Listeners are never removed: Swift bridges the
+  // closure to a new block on every call, so CMIOObjectRemovePropertyListenerBlock cannot find the
+  // registered one anyway. Object IDs are not reused (they keep increasing), so the listener of a
+  // vanished device never fires again, and a device that drops out of the list and comes back
+  // keeps its one listener.
+  private var listenedDeviceIDs: Set<CMIOObjectID> = []
   private var timer: DispatchSourceTimer?
   private var deviceListAvailable = true
-  // nil until the first evaluation, so the initial state is always reported (startup sync)
+  // Nothing is reported before the device list has been read once: an unreadable list is not OFF
+  private var hasDeviceList = false
+  // nil until the first report, so the initial state is always reported (startup sync)
   private var lastState: Bool?
   private var lastRunningDeviceName: String?
+  private var pendingOff: DispatchWorkItem?
+  // Between "system will sleep" and wake, OFF is reported at once: the process may be suspended
+  // before offDelay elapses
+  private var sleepImminent = false
   private var lastTotalSleepNanos: UInt64?
 
   /// - Parameters:
   ///   - queue: Serial queue on which CoreMediaIO is queried and callbacks are delivered
   ///   - pollInterval: Interval of the periodic rescan that backs up the CoreMediaIO listeners
-  public init(queue: DispatchQueue = .main, pollInterval: TimeInterval = 1) {
+  ///   - offDelay: How long no camera must be in use before OFF is reported
+  public init(
+    queue: DispatchQueue = DispatchQueue(label: "camera-notifier.monitor"),
+    pollInterval: TimeInterval = 1, offDelay: TimeInterval = 5
+  ) {
     self.queue = queue
     self.pollInterval = pollInterval
+    self.offDelay = offDelay
   }
 
-  /// Start monitoring. The current state is reported once right away, then on every change.
-  /// The callback is invoked on the monitor's queue.
+  /// Start monitoring. The current state is reported once the device list has been read, then on
+  /// every change. The callback is invoked on the monitor's queue.
   public func start(onStateChange: @escaping StateChangeCallback) {
     queue.async {
       self.onStateChange = onStateChange
       self.installDeviceListListener()
       self.refreshDevices()
       self.log(
-        "Monitoring \(self.devices.count) camera device(s); rescanning every \(self.pollInterval)s"
-      )
+        "Monitoring \(self.devices.count) camera device(s); rescanning every \(self.pollInterval)s, "
+          + "reporting OFF after \(self.offDelay)s without camera use")
       self.evaluate()
       self.startTimer()
     }
+  }
+
+  /// Report an OFF that is still waiting for `offDelay` right away, e.g. before the process exits.
+  /// Waits at most `timeout`. Must not be called on the monitor's queue.
+  public func flushPendingOff(timeout: TimeInterval = 1) {
+    runAndWait(timeout: timeout) {
+      if self.pendingOff != nil {
+        self.evaluate(offDelayElapsed: true)
+      }
+    }
+  }
+
+  /// The system is about to sleep: report a pending OFF now, and until `systemDidWake()` report
+  /// OFF without waiting for `offDelay`. Waits at most `timeout`. Must not be called on the
+  /// monitor's queue.
+  public func systemWillSleep(timeout: TimeInterval = 1) {
+    runAndWait(timeout: timeout) {
+      self.sleepImminent = true
+      if self.lastState == true {
+        self.log("System is going to sleep")
+      }
+      self.evaluate()
+    }
+  }
+
+  /// The system woke up, or the sleep was cancelled: OFF is reported after `offDelay` again.
+  public func systemDidWake() {
+    queue.async {
+      self.sleepImminent = false
+    }
+  }
+
+  private func runAndWait(timeout: TimeInterval, _ work: @escaping () -> Void) {
+    dispatchPrecondition(condition: .notOnQueue(queue))
+    let done = DispatchSemaphore(value: 0)
+    queue.async {
+      work()
+      done.signal()
+    }
+    _ = done.wait(timeout: .now() + timeout)
   }
 
   // MARK: - Periodic rescan
@@ -108,15 +164,13 @@ public final class CameraMonitor {
 
   private func installDeviceListListener() {
     var address = Self.propertyAddress(kCMIOHardwarePropertyDevices)
-    let listener: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
+    let status = CMIOObjectAddPropertyListenerBlock(Self.systemObject, &address, queue) {
+      [weak self] _, _ in
       guard let self else { return }
       self.refreshDevices()
       self.evaluate()
     }
-    let status = CMIOObjectAddPropertyListenerBlock(Self.systemObject, &address, queue, listener)
-    if status == noErr {
-      deviceListListener = listener
-    } else {
+    if status != noErr {
       log("Could not register device list listener (OSStatus \(status)), relying on rescan only")
     }
   }
@@ -133,53 +187,79 @@ public final class CameraMonitor {
       deviceListAvailable = true
       log("Camera device list is available again")
     }
+    hasDeviceList = true
 
     let current = Set(ids)
-    for (id, device) in devices where !current.contains(id) {
-      removeRunningListener(id: id, listener: device.runningListener)
+    for (id, name) in devices where !current.contains(id) {
       devices[id] = nil
-      log("Camera device removed: \(device.name) [id=\(id)]")
+      log("Camera device removed: \(name) [id=\(id)]")
     }
     for id in ids where devices[id] == nil {
       let name = Self.stringProperty(id, kCMIOObjectPropertyName) ?? "(Name not available)"
       let uid = Self.stringProperty(id, kCMIODevicePropertyDeviceUID) ?? "unknown"
-      devices[id] = Device(name: name, uid: uid, runningListener: addRunningListener(id: id))
+      devices[id] = name
+      if !listenedDeviceIDs.contains(id), addRunningListener(id: id) {
+        listenedDeviceIDs.insert(id)
+      }
       log("Camera device added: \(name) [id=\(id) uid=\(uid)]")
     }
   }
 
-  private func addRunningListener(id: CMIOObjectID) -> CMIOObjectPropertyListenerBlock? {
+  private func addRunningListener(id: CMIOObjectID) -> Bool {
     var address = Self.propertyAddress(kCMIODevicePropertyDeviceIsRunningSomewhere)
-    let listener: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
+    let status = CMIOObjectAddPropertyListenerBlock(id, &address, queue) { [weak self] _, _ in
       self?.evaluate()
     }
-    let status = CMIOObjectAddPropertyListenerBlock(id, &address, queue, listener)
-    return status == noErr ? listener : nil
-  }
-
-  private func removeRunningListener(id: CMIOObjectID, listener: CMIOObjectPropertyListenerBlock?) {
-    guard let listener else { return }
-    var address = Self.propertyAddress(kCMIODevicePropertyDeviceIsRunningSomewhere)
-    // Fails harmlessly when the device object is already gone
-    _ = CMIOObjectRemovePropertyListenerBlock(id, &address, queue, listener)
+    return status == noErr
   }
 
   // MARK: - State evaluation
 
-  private func evaluate() {
-    let runningName = devices.keys.sorted()
-      .first { Self.isRunningSomewhere($0) == true }
-      .flatMap { devices[$0]?.name }
-    let isRunning = runningName != nil
-    defer {
-      if let runningName { lastRunningDeviceName = runningName }
-    }
+  private func evaluate(offDelayElapsed: Bool = false) {
+    guard hasDeviceList else { return }
 
+    if let runningName = runningDeviceName() {
+      lastRunningDeviceName = runningName
+      cancelPendingOff()
+      report(isRunning: true, deviceName: runningName)
+    } else if offDelayElapsed || sleepImminent {
+      cancelPendingOff()
+      report(isRunning: false, deviceName: lastRunningDeviceName)
+    } else if lastState != false {
+      // Possibly just a short pause (an app restarting capture, a failed read): report OFF only if
+      // it lasts. The initial state goes through this too, so a restart never flashes the light.
+      scheduleOff()
+    }
+  }
+
+  // A failed read counts as "not in use"; offDelay absorbs a transient failure
+  private func runningDeviceName() -> String? {
+    devices.keys.sorted()
+      .first { Self.isRunningSomewhere($0) == true }
+      .flatMap { devices[$0] }
+  }
+
+  private func report(isRunning: Bool, deviceName: String?) {
     guard isRunning != lastState else { return }
     lastState = isRunning
-    let deviceName = isRunning ? runningName : lastRunningDeviceName
     log("Camera state changed: \(isRunning ? "ON" : "OFF") - Device: \(deviceName ?? "unknown")")
     onStateChange?(CameraStateChange(isRunning: isRunning, deviceName: deviceName))
+  }
+
+  private func scheduleOff() {
+    guard pendingOff == nil else { return }
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingOff = nil
+      self.evaluate(offDelayElapsed: true)
+    }
+    pendingOff = workItem
+    queue.asyncAfter(deadline: .now() + offDelay, execute: workItem)
+  }
+
+  private func cancelPendingOff() {
+    pendingOff?.cancel()
+    pendingOff = nil
   }
 
   // MARK: - CoreMediaIO helpers

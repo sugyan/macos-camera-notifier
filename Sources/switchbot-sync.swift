@@ -10,6 +10,8 @@ public class SwitchBotSyncHandler: CameraStateHandler {
 
   private static let maxAttempts = 8
   private static let maxRetryDelay: TimeInterval = 60
+  // How long to wait for the last command at shutdown (launchd sends SIGKILL after 20 s)
+  private static let shutdownTimeout: TimeInterval = 5
 
   private var client: SwitchBotClient?
   private var targetDeviceId: String?
@@ -21,6 +23,8 @@ public class SwitchBotSyncHandler: CameraStateHandler {
   private var inFlight = false
   private var attempt = 0
   private var retryWorkItem: DispatchWorkItem?
+  private var shuttingDown = false
+  private var idleWaiters: [DispatchSemaphore] = []
 
   public var isEnabled: Bool {
     return client != nil && targetDeviceId != nil
@@ -114,12 +118,46 @@ public class SwitchBotSyncHandler: CameraStateHandler {
     }
   }
 
+  public func flush(timeout: TimeInterval) {
+    deliverNow(timeout: timeout, beforeExit: false)
+  }
+
+  public func cleanup() {
+    deliverNow(timeout: Self.shutdownTimeout, beforeExit: true)
+  }
+
+  // Send a command that is waiting for its retry right away, then wait (at most `timeout`) until
+  // nothing is in flight. Before exit, failures are not retried any more.
+  private func deliverNow(timeout: TimeInterval, beforeExit: Bool) {
+    let idle = DispatchSemaphore(value: 0)
+    queue.async {
+      if beforeExit {
+        self.shuttingDown = true
+      }
+      if let retryWorkItem = self.retryWorkItem {
+        retryWorkItem.cancel()
+        self.retryWorkItem = nil
+        self.hasPending = true
+      }
+      if !self.inFlight {
+        self.sendPending()
+      }
+      self.idleWaiters.append(idle)
+      self.signalIdleWaiters()
+    }
+    if idle.wait(timeout: .now() + timeout) == .timedOut {
+      HandlerLogger.log(
+        "Command still in flight after \(Int(timeout))s, not waiting any longer", handler: name)
+    }
+  }
+
   // MARK: - Command delivery (runs on `queue`)
   //
-  // Only one request is in flight at a time, so commands can never overtake each other. If the
-  // camera state changes while a request is in flight, only the latest state is sent afterwards.
-  // Failed requests are retried with exponential backoff until they succeed, the attempts run out,
-  // or a newer state supersedes them.
+  // Only one request is in flight at a time, and if the camera state changes meanwhile, only the
+  // latest state is sent afterwards. Failed requests are retried with exponential backoff until
+  // they succeed, the attempts run out, or a newer state supersedes them. (A request that timed out
+  // may still be carried out by the SwitchBot cloud later, after a newer command; that rare case is
+  // corrected by the next state change.)
 
   private func request(_ command: PlugCommand) {
     desired = command
@@ -134,10 +172,10 @@ public class SwitchBotSyncHandler: CameraStateHandler {
   }
 
   private func sendPending() {
-    guard hasPending, let command = desired, let client = client, let deviceId = targetDeviceId
-    else { return }
-
+    guard hasPending else { return }
     hasPending = false
+    guard let command = desired, let client = client, let deviceId = targetDeviceId else { return }
+
     inFlight = true
     attempt += 1
 
@@ -161,6 +199,10 @@ public class SwitchBotSyncHandler: CameraStateHandler {
       if hasPending {
         // A newer state is waiting and supersedes this command
         HandlerLogger.log("Device control failed: \(reason)", handler: name)
+      } else if shuttingDown {
+        HandlerLogger.log(
+          "Device control failed: \(reason), not retrying because the notifier is shutting down",
+          handler: name)
       } else if Self.isRetryable(error) && attempt < Self.maxAttempts {
         let delay = min(Self.maxRetryDelay, pow(2, Double(attempt)))
         HandlerLogger.log(
@@ -176,6 +218,14 @@ public class SwitchBotSyncHandler: CameraStateHandler {
     if hasPending {
       sendPending()
     }
+    signalIdleWaiters()
+  }
+
+  // Wake up flush/cleanup callers once nothing is in flight (a scheduled retry does not count)
+  private func signalIdleWaiters() {
+    guard !inFlight, !hasPending else { return }
+    idleWaiters.forEach { $0.signal() }
+    idleWaiters.removeAll()
   }
 
   private func scheduleRetry(after delay: TimeInterval) {
@@ -298,16 +348,15 @@ private class SwitchBotClient {
     }.resume()
   }
 
-  // Decode a response and check the API level status code (100 means success)
-  private static func decode<T: Decodable & SwitchBotResponse>(_ type: T.Type, from data: Data)
-    -> Result<T, Error>
-  {
+  // Check the API level status code (100 means success) before decoding the whole response:
+  // error responses come with an empty or differently shaped body
+  private static func decode<T: Decodable>(_ type: T.Type, from data: Data) -> Result<T, Error> {
     do {
-      let response = try JSONDecoder().decode(type, from: data)
-      guard response.statusCode == 100 else {
-        return .failure(SwitchBotError.apiStatus(response.statusCode, response.message))
+      let status = try JSONDecoder().decode(StatusEnvelope.self, from: data)
+      guard status.statusCode == 100 else {
+        return .failure(SwitchBotError.apiStatus(status.statusCode, status.message ?? ""))
       }
-      return .success(response)
+      return .success(try JSONDecoder().decode(type, from: data))
     } catch {
       return .failure(error)
     }
@@ -365,12 +414,13 @@ private enum SwitchBotError: Error, CustomStringConvertible {
   }
 }
 
-private protocol SwitchBotResponse {
-  var statusCode: Int { get }
-  var message: String { get }
+// The fields every API response has
+private struct StatusEnvelope: Decodable {
+  let statusCode: Int
+  let message: String?
 }
 
-private struct DeviceListResponse: Decodable, SwitchBotResponse {
+private struct DeviceListResponse: Decodable {
   let statusCode: Int
   let message: String
   let body: DeviceListBody
@@ -396,7 +446,7 @@ private struct CommandRequest: Encodable {
 }
 
 // The response body is not needed; only the status is checked
-private struct CommandResponse: Decodable, SwitchBotResponse {
+private struct CommandResponse: Decodable {
   let statusCode: Int
   let message: String
 }
