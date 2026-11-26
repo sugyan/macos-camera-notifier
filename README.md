@@ -8,10 +8,12 @@ Automatically turns SwitchBot plugs ON when camera starts and OFF when camera st
 
 ### Features
 
-- 🎥 **Real-time camera monitoring** using CoreMediaIO framework
-- 🔌 **SwitchBot device control** with automatic device detection
+- 🎥 **Real-time camera monitoring** using CoreMediaIO property listeners, backed by a periodic rescan
+- 🔁 **Hot-plug aware**: cameras connected after startup (USB replug, dock reconnect, Continuity Camera) and cameras re-enumerated after sleep are picked up automatically
+- ⏱️ **No flicker**: OFF is reported only after no camera has been in use for 5 seconds (configurable), so an app briefly restarting its camera (e.g. a meeting app going from preview to the call) does not toggle the plug. A pending OFF is still sent right before sleep or shutdown
+- 🔌 **SwitchBot device control** with automatic device detection, in-order delivery (only the latest state is sent) and retries on failure
 - 🚀 **macOS auto-start support** via launchd background service
-- 📊 **Comprehensive logging** with separate error tracking
+- 📊 **Comprehensive logging** of camera state, device add/remove and wake from sleep
 - ⚙️ **Extensible handler system** for future integrations
 
 ## Use Cases
@@ -43,7 +45,10 @@ make build
 make run
 
 # Or run directly
-SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./camera-notifier
+SWITCHBOT_TOKEN="your_token" SWITCHBOT_SECRET="your_secret" ./.build/release/camera-notifier
+
+# Check camera detection only, without controlling any device
+./.build/release/camera-notifier --handlers log
 ```
 
 ## Auto-Start Setup (Optional)
@@ -61,6 +66,9 @@ export SWITCHBOT_SECRET="your_secret_here"
 ./scripts/install-launchd.sh
 ```
 
+The script builds the binary, generates the plist (readable only by you, since it contains the token), and (re)loads the service.
+The plist stores the absolute path of the binary, so run it again after moving the repository.
+
 ### Manual Setup
 
 ```bash
@@ -69,31 +77,36 @@ make build
 
 # 2. Copy and edit plist template
 cp launchd/com.sugyan.camera-notifier.plist.template ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+chmod 600 ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
 
 # 3. Edit the plist file and replace placeholders:
 #    {{BINARY_PATH}} - Full path to binary
 #    {{SWITCHBOT_TOKEN}} - Your API token
 #    {{SWITCHBOT_SECRET}} - Your API secret
+#    {{SWITCHBOT_DEVICE_ID_LINE}} - Remove, or replace with a SWITCHBOT_DEVICE_ID key/string pair
 
 # 4. Load the service
-launchctl load ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
 ```
 
 ### Service Management
 
 ```bash
 # Check service status
-launchctl list | grep camera-notifier
+# (filtered: plain `launchctl print` also shows the SwitchBot token and secret)
+launchctl print gui/$(id -u)/com.sugyan.camera-notifier | grep -E '^[[:space:]]*(state|pid|program|last exit code) = '
 
 # View logs
 tail -f /tmp/camera-notifier.log
 
-# Stop service
-launchctl stop com.sugyan.camera-notifier
+# Restart service (e.g. after rebuilding)
+launchctl kickstart -k gui/$(id -u)/com.sugyan.camera-notifier
 
-# Disable auto-start
-launchctl unload ~/Library/LaunchAgents/com.sugyan.camera-notifier.plist
+# Stop service (until next login or bootstrap)
+launchctl bootout gui/$(id -u)/com.sugyan.camera-notifier
 ```
+
+To disable auto-start permanently, run `bootout` and remove `~/Library/LaunchAgents/com.sugyan.camera-notifier.plist`.
 
 ## Examples
 
@@ -107,21 +120,34 @@ make run
 export VERBOSE=1
 make run
 
+# Log camera state changes only (no SwitchBot)
+./.build/release/camera-notifier --handlers log
+
+# Report OFF 2 seconds after the camera stops instead of 5
+./.build/release/camera-notifier --off-delay 2
+
 # Show help
-./camera-notifier --help
+./.build/release/camera-notifier --help
 ```
 
 ## Sample Output
 
 ```
-[2024-01-15 10:30:45] Camera Notifier starting...
-[2024-01-15 10:30:45] Active handlers: SwitchBot
-[2024-01-15 10:30:46] [SwitchBot] Auto-detected device: Living Room Plug (ABC123DEF456)
-[2024-01-15 10:30:46] Camera monitoring started. Press Ctrl+C to stop.
-[2024-01-15 10:31:12] [SwitchBot] Camera started: FaceTime HD Camera, sending turnOn command
-[2024-01-15 10:31:13] [SwitchBot] Device control success: success
-[2024-01-15 10:35:20] [SwitchBot] Camera stopped: FaceTime HD Camera, sending turnOff command
-[2024-01-15 10:35:21] [SwitchBot] Device control success: success
+[2026-01-15 10:30:45] Camera Notifier starting...
+[2026-01-15 10:30:46] [SwitchBot] Auto-detected device: Living Room Plug (ABC123DEF456)
+[2026-01-15 10:30:46] Active handlers: SwitchBot
+[2026-01-15 10:30:46] Camera monitoring started. Press Ctrl+C to stop.
+[2026-01-15 10:30:46] [CameraMonitor] Camera device added: FaceTime HD Camera [id=34 uid=...]
+[2026-01-15 10:30:46] [CameraMonitor] Monitoring 1 camera device(s); rescanning every 1.0s, reporting OFF after 5.0s without camera use
+[2026-01-15 10:30:51] [CameraMonitor] Camera state changed: OFF - Device: unknown
+[2026-01-15 10:30:51] [SwitchBot] Camera stopped: Unknown device, sending turnOff command
+[2026-01-15 10:30:52] [SwitchBot] Device control success: turnOff (success)
+[2026-01-15 10:31:12] [CameraMonitor] Camera state changed: ON - Device: FaceTime HD Camera
+[2026-01-15 10:31:12] [SwitchBot] Camera started: FaceTime HD Camera, sending turnOn command
+[2026-01-15 10:31:13] [SwitchBot] Device control success: turnOn (success)
+[2026-01-15 12:02:40] [CameraMonitor] Resumed after system sleep (slept ~1h25m), rescanning camera devices
+[2026-01-15 12:02:41] [CameraMonitor] Camera device removed: USB Camera [id=44]
+[2026-01-15 12:02:42] [CameraMonitor] Camera device added: USB Camera [id=52 uid=...]
 ```
 
 ## Configuration
@@ -131,19 +157,23 @@ make run
 | `SWITCHBOT_TOKEN`     | SwitchBot API token                        | Yes      |
 | `SWITCHBOT_SECRET`    | SwitchBot API secret                       | Yes      |
 | `SWITCHBOT_DEVICE_ID` | Target device ID (auto-detects if not set) | No       |
+| `CAMERA_HANDLERS`     | Handlers to enable: `switchbot`, `log` (default: `switchbot`) | No |
+| `CAMERA_OFF_DELAY`    | Seconds without camera use before OFF is reported (default: `5`, or `--off-delay`) | No |
 | `VERBOSE`             | Enable verbose logging (set to `1`)        | No       |
 
 ## Troubleshooting
 
-### Camera Permission Required
+### Camera Not Detected
 
-Grant camera access in: **System Preferences → Security & Privacy → Camera**
+Run `./.build/release/camera-notifier --handlers log` and check that your camera shows up in a `Camera device added` line, and that `Camera state changed: ON` appears when an app starts using it.
+If no devices are listed, check **System Settings → Privacy & Security → Camera**.
 
 ### SwitchBot Device Not Found
 
 - Verify device is connected in SwitchBot app
 - Check token/secret are correct
 - Ensure internet connectivity
+- Set `SWITCHBOT_DEVICE_ID` to skip auto-detection (the auto-detected ID is printed in the log)
 
 ### Service Issues
 
@@ -157,13 +187,15 @@ tail -f /tmp/camera-notifier.log
 tail -f /tmp/camera-notifier-error.log
 
 # Check service status
-launchctl list | grep camera-notifier
+launchctl print gui/$(id -u)/com.sugyan.camera-notifier | grep -E '^[[:space:]]*(state|pid|program|last exit code) = '
 ```
 
 ### Common Issues
 
 - **Service not starting**: Check environment variables in plist file
-- **Camera not detected**: Verify camera permissions in System Preferences
+- **Service runs an old binary**: The plist stores the absolute binary path; re-run `./scripts/install-launchd.sh` after moving the repository
+- **Plug not switching**: Look for `Device control failed` lines; failed commands are retried with backoff (up to 8 attempts)
+- **Plug turns off a few seconds late**: Intended, see `CAMERA_OFF_DELAY`; a shorter delay makes brief camera restarts toggle the plug
 - **API errors**: Validate SwitchBot token/secret in mobile app
 
 ## Build Commands

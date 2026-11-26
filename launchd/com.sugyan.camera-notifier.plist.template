@@ -36,8 +36,10 @@
 	<key>StandardErrorPath</key>
 	<string>/tmp/camera-notifier-error.log</string>
 
+	<!-- Standard (not Background): reacting to camera changes is user-facing, and Background
+	     jobs get heavy CPU/IO throttling and timer coalescing -->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 
 	<key>LowPriorityIO</key>
 	<true/>
